@@ -25,25 +25,72 @@ See [`bench/REPORT.md`](bench/REPORT.md).
 ## Install
 
 Prebuilt for **DuckDB v1.5.5** on Linux x86_64 and arm64 (glibc 2.28 or later)
-and Windows x86_64.
+and Windows x86_64. No compiler is needed.
 
-1. Install [Oracle Instant Client 19](https://www.oracle.com/database/technologies/instant-client.html)
-   (Basic or Basic Light) and put its directory in `LD_LIBRARY_PATH` (Linux) or
-   `PATH` (Windows). On Linux it needs `libaio` and `libnsl`; on Ubuntu 24.04,
-   install `libaio1t64` and link `libaio.so.1` to `libaio.so.1t64`.
-2. Start DuckDB with `duckdb -unsigned` (Python:
-   `duckdb.connect(config={"allow_unsigned_extensions": "true"})`), then:
+The extension needs [Oracle Instant Client 19](https://www.oracle.com/database/technologies/instant-client.html)
+(Basic or Basic Light): put its directory in `LD_LIBRARY_PATH` (Linux) or `PATH`
+(Windows) **before** starting DuckDB or Python. On Linux, Instant Client needs
+`libaio` and `libnsl`; on Ubuntu 24.04, install `libaio1t64` and link
+`libaio.so.1` to `libaio.so.1t64`.
 
-   ```sql
-   INSTALL oraduck FROM 'https://hugues31.github.io/oraduck';
-   LOAD oraduck;
+### Online
+
+```sql
+-- duckdb -unsigned
+-- Python: con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+INSTALL oraduck FROM 'https://hugues31.github.io/oraduck';
+LOAD oraduck;
+```
+
+### Offline
+
+1. On a connected machine, download:
+   - `oraduck-repository.tar.gz` from the [latest release](https://github.com/hugues31/oraduck/releases/latest)
+     (all platforms);
+   - the Instant Client 19 Basic zip for the target platform, for example
+     `instantclient-basic-linux.x64-19.32.0.0.0dbru.zip`;
+   - for the CLI: `duckdb_cli-linux-amd64.zip` (or `-linux-arm64`,
+     `-windows-amd64`) from the [DuckDB v1.5.5 release](https://github.com/duckdb/duckdb/releases/tag/v1.5.5);
+   - for Python: `pip download duckdb==1.5.5 -d wheels`, on a machine with the
+     same OS, architecture and Python version as the target.
+2. Copy the files to the target machine and extract them (Linux shown; on
+   Windows, extract the same archives and add `instantclient_19_32` to `PATH`):
+
+   ```sh
+   mkdir -p /opt/oraduck /opt/oracle
+   tar -xzf oraduck-repository.tar.gz -C /opt/oraduck
+   unzip instantclient-basic-linux.x64-19.32.0.0.0dbru.zip -d /opt/oracle
+   export LD_LIBRARY_PATH=/opt/oracle/instantclient_19_32:$LD_LIBRARY_PATH
    ```
 
-**Offline**: download `oraduck-repository.tar.gz` from the
-[latest release](https://github.com/hugues31/oraduck/releases/latest), extract
-it on the target machine (or on an internal web server) and run
-`INSTALL oraduck FROM '/path/to/extracted/directory'` (or its URL). No compiler
-is needed.
+3. Install the extension from the extracted directory. `INSTALL` copies it into
+   `~/.duckdb/extensions/v1.5.5/<platform>/` once; later sessions only need
+   `LOAD oraduck`.
+
+   **CLI**
+
+   ```sh
+   unzip duckdb_cli-linux-amd64.zip
+   ./duckdb -unsigned -c "INSTALL oraduck FROM '/opt/oraduck'; LOAD oraduck; SELECT oraduck_oci_version();"
+   ```
+
+   **Python**
+
+   ```sh
+   pip install --no-index --find-links wheels duckdb==1.5.5
+   ```
+
+   ```python
+   import duckdb
+
+   con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+   con.execute("INSTALL oraduck FROM '/opt/oraduck'")
+   con.load_extension("oraduck")
+   print(con.sql("SELECT oraduck_oci_version()").fetchone())
+   ```
+
+The extracted directory can also be served by an internal web server:
+`INSTALL oraduck FROM 'https://mirror.example.com/oraduck'`.
 
 ## Build
 
