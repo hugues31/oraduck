@@ -2,7 +2,7 @@
 
 - **Date**: 2026-09-23
 - **Status**: implemented (v1)
-- **Author**: Hugues Gaillard (with Claude)
+- **Author**: Hugues Gaillard
 
 ## 1. Context and goal
 
