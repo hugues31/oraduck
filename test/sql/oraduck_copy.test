@@ -1,0 +1,28 @@
+# name: test/sql/oraduck_copy.test
+# description: COPY FORMAT ORADUCK errors detected without Oracle
+# group: [oraduck]
+
+require oraduck
+
+statement error
+COPY (SELECT 1 AS id) TO 'BENCH.T' (FORMAT oraduck);
+----
+CONNECTION
+
+statement error
+COPY (SELECT 1 AS id) TO 'BENCH.T' (FORMAT oraduck, CONNECTION 'absent');
+----
+not found
+
+statement error
+COPY (SELECT 1 AS id) TO 'BENCH.T' (FORMAT oraduck, CONNECTION 'absent', TOTO 1);
+----
+Unrecognized option
+
+statement ok
+CREATE TABLE t (id INTEGER);
+
+statement error
+COPY t FROM 'BENCH.T' (FORMAT oraduck);
+----
+not supported

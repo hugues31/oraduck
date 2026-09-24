@@ -1,0 +1,10 @@
+# name: test/sql/oraduck.test
+# description: OraDuck extension loading and OCI linkage
+# group: [oraduck]
+
+require oraduck
+
+query I
+SELECT oraduck_oci_version() LIKE '19.32.%';
+----
+true

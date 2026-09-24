@@ -1,0 +1,9 @@
+/build/
+/.deps/
+/.venv/
+/.superpowers/
+/bench/work/
+__pycache__/
+.pytest_cache/
+.cache/
+/duckdb_unittest_tempdir/

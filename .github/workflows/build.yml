@@ -1,0 +1,150 @@
+# Builds the loadable extension for Linux (amd64, arm64) and Windows (amd64), runs the tests that do
+# not need an Oracle database, and on a v* tag publishes:
+#   - a DuckDB extension repository on GitHub Pages: <pages>/v1.5.5/<platform>/oraduck.duckdb_extension.gz
+#   - a GitHub release with the extension files
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  DUCKDB_VERSION: v1.5.5
+  # The submodules are cloned without their tags: the DuckDB version is set explicitly
+  OVERRIDE_GIT_DESCRIBE: v1.5.5
+  GEN: ninja
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  EXT_FLAGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+jobs:
+  linux:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    # glibc 2.28, like DuckDB's own Linux builds: loads on RHEL / Oracle Linux 8 and newer
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux_amd64, runner: ubuntu-24.04, arch: x86_64, instantclient: linux-x64 }
+          - { platform: linux_arm64, runner: ubuntu-24.04-arm, arch: aarch64, instantclient: linux-arm64 }
+    env:
+      DUCKDB_PLATFORM: ${{ matrix.platform }}
+      CCACHE_DIR: /ccache
+    steps:
+      - name: Install build and Instant Client dependencies
+        run: yum install -y ninja-build ccache libaio libnsl unzip
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/cache@v4
+        with:
+          path: /ccache
+          key: ccache-${{ matrix.platform }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.platform }}-
+
+      - name: Install Oracle Instant Client 19 (Basic, SDK)
+        run: |
+          ./infra/instantclient/install.sh ${{ matrix.instantclient }} basic sdk
+          echo "OCI_HOME=$PWD/.deps/instantclient_19_32" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD/.deps/instantclient_19_32" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: make release
+
+      - name: Unit tests
+        run: make unit
+
+      - name: SQL tests (no Oracle database)
+        run: make test
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oraduck-${{ matrix.platform }}
+          path: build/release/extension/oraduck/oraduck.duckdb_extension
+          if-no-files-found: error
+
+  windows:
+    name: windows_amd64
+    runs-on: windows-latest
+    env:
+      DUCKDB_PLATFORM: windows_amd64
+      CC: cl
+      CXX: cl
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ccache-windows_amd64
+
+      - name: Install ninja
+        run: choco install ninja -y
+
+      - name: Install Oracle Instant Client 19 (Basic, SDK)
+        run: |
+          ./infra/instantclient/install.sh windows-x64 basic sdk
+          echo "OCI_HOME=$(cygpath -m "$PWD/.deps/instantclient_19_32")" >> "$GITHUB_ENV"
+          cygpath -w "$PWD/.deps/instantclient_19_32" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: |
+          # Git's link.exe shadows MSVC's linker
+          mv "/c/Program Files/Git/usr/bin/link.exe" "/c/Program Files/Git/usr/bin/link-git.exe"
+          make release
+
+      - name: SQL tests (no Oracle database)
+        run: make test
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oraduck-windows_amd64
+          path: build/release/extension/oraduck/oraduck.duckdb_extension
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Build the extension repository and the release files
+        run: ./infra/release/package.sh dist site release
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* --title "OraDuck $GITHUB_REF_NAME" \
+            --notes "Built for DuckDB $DUCKDB_VERSION. Install: see README.md."
