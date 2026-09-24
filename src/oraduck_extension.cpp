@@ -7,18 +7,21 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
+#include "oraduck/errors.hpp"
+#include "oraduck/oci_api.hpp"
 #include "oraduck_copy.hpp"
 #include "oraduck_secret.hpp"
 
-// OCI headers after DuckDB: oratypes.h defines TRUE/FALSE
-#include <oci.h>
-
 namespace duckdb {
 
-// Version of the loaded OCI client library (installation diagnostics)
+// Version of the Instant Client library that OraDuck loads (installation diagnostics)
 static void OraduckOciVersion(DataChunk &args, ExpressionState &state, Vector &result) {
-	sword major = 0, minor = 0, update = 0, patch = 0, port_update = 0;
-	OCIClientVersion(&major, &minor, &update, &patch, &port_update);
+	oraduck::sword major = 0, minor = 0, update = 0, patch = 0, port_update = 0;
+	try {
+		oraduck::Oci().OCIClientVersion(&major, &minor, &update, &patch, &port_update);
+	} catch (const oraduck::OraduckError &e) {
+		throw IOException("OraDuck: " + string(e.what()));
+	}
 	auto text = StringUtil::Format("%d.%d.%d.%d.%d", major, minor, update, patch, port_update);
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	ConstantVector::GetData<string_t>(result)[0] = StringVector::AddString(result, text);

@@ -56,19 +56,24 @@ jobs:
           key: ccache-${{ matrix.platform }}-${{ github.sha }}
           restore-keys: ccache-${{ matrix.platform }}-
 
-      - name: Install Oracle Instant Client 19 (Basic, SDK)
-        run: |
-          ./infra/instantclient/install.sh ${{ matrix.instantclient }} basic sdk
-          echo "OCI_HOME=$PWD/.deps/instantclient_19_32" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$PWD/.deps/instantclient_19_32" >> "$GITHUB_ENV"
-
       - name: Build
         run: make release
 
       - name: Unit tests
         run: make unit
 
-      - name: SQL tests (no Oracle database)
+      # Like DuckDB's community CI: the extension must load and pass its SQL tests without Instant Client
+      - name: SQL tests without Instant Client
+        run: make test
+
+      # Instant Client is only loaded at run time (dlopen), for the tests that talk to OCI
+      - name: Install Oracle Instant Client 19 (Basic)
+        run: |
+          ./infra/instantclient/install.sh ${{ matrix.instantclient }} basic
+          echo "OCI_HOME=$PWD/.deps/instantclient_19_32" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD/.deps/instantclient_19_32" >> "$GITHUB_ENV"
+
+      - name: SQL tests with Instant Client (no Oracle database)
         run: make test
 
       - uses: actions/upload-artifact@v4
@@ -101,19 +106,22 @@ jobs:
       - name: Install ninja
         run: choco install ninja -y
 
-      - name: Install Oracle Instant Client 19 (Basic, SDK)
-        run: |
-          ./infra/instantclient/install.sh windows-x64 basic sdk
-          echo "OCI_HOME=$(cygpath -m "$PWD/.deps/instantclient_19_32")" >> "$GITHUB_ENV"
-          cygpath -w "$PWD/.deps/instantclient_19_32" >> "$GITHUB_PATH"
-
       - name: Build
         run: |
           # Git's link.exe shadows MSVC's linker
           mv "/c/Program Files/Git/usr/bin/link.exe" "/c/Program Files/Git/usr/bin/link-git.exe"
           make release
 
-      - name: SQL tests (no Oracle database)
+      - name: SQL tests without Instant Client
+        run: make test
+
+      - name: Install Oracle Instant Client 19 (Basic)
+        run: |
+          ./infra/instantclient/install.sh windows-x64 basic
+          echo "OCI_HOME=$(cygpath -m "$PWD/.deps/instantclient_19_32")" >> "$GITHUB_ENV"
+          cygpath -w "$PWD/.deps/instantclient_19_32" >> "$GITHUB_PATH"
+
+      - name: SQL tests with Instant Client (no Oracle database)
         run: make test
 
       - uses: actions/upload-artifact@v4

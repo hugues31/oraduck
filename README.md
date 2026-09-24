@@ -27,11 +27,12 @@ See [`bench/REPORT.md`](bench/REPORT.md).
 Prebuilt for **DuckDB v1.5.5** on Linux x86_64 and arm64 (glibc 2.28 or later)
 and Windows x86_64. No compiler is needed.
 
-The extension needs [Oracle Instant Client 19](https://www.oracle.com/database/technologies/instant-client.html)
-(Basic or Basic Light): put its directory in `LD_LIBRARY_PATH` (Linux) or `PATH`
-(Windows) **before** starting DuckDB or Python. On Linux, Instant Client needs
-`libaio` and `libnsl`; on Ubuntu 24.04, install `libaio1t64` and link
-`libaio.so.1` to `libaio.so.1t64`.
+OraDuck loads [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html)
+19 or later (Basic or Basic Light; tested with 19.32) the first time it talks to
+Oracle: put its directory in `LD_LIBRARY_PATH` (Linux) or `PATH` (Windows)
+**before** starting DuckDB or Python. Without it, the extension still loads and
+reports what is missing. On Linux, Instant Client needs `libaio` and `libnsl`;
+on Ubuntu 24.04, install `libaio1t64` and link `libaio.so.1` to `libaio.so.1t64`.
 
 ### Online
 
@@ -94,14 +95,13 @@ The extracted directory can also be served by an internal web server:
 
 ## Build
 
-Requirements: Oracle Instant Client 19 with its SDK (`./infra/instantclient/install.sh`
-downloads 19.32 into `.deps/`, `source env.sh` sets `OCI_HOME` and
-`LD_LIBRARY_PATH`), a C++17 compiler, CMake and Ninja.
+Requirements: a C++17 compiler, CMake and Ninja. Building needs no Oracle
+software; the tests that talk to OCI need Instant Client
+(`./infra/instantclient/install.sh` downloads 19.32 into `.deps/`,
+`source env.sh` sets `OCI_HOME` and `LD_LIBRARY_PATH`).
 
 ```sh
 git clone --recurse-submodules https://github.com/hugues31/oraduck && cd oraduck
-./infra/instantclient/install.sh
-source env.sh
 GEN=ninja make release
 # DuckDB CLI with the extension built in:  build/release/duckdb
 # loadable extension:                      build/release/extension/oraduck/oraduck.duckdb_extension
@@ -171,10 +171,10 @@ Any other type is rejected at bind time: convert it with `CAST`.
 ## Tests
 
 ```sh
-source env.sh
-make unit          # encoders and name parsing (no Oracle)
+./infra/instantclient/install.sh && source env.sh
+make unit          # encoders, name parsing, OCI loader (no Oracle)
 make itest         # OCI layer and direct path loader (Oracle required)
-make test          # sqllogictest
+make test          # sqllogictest (Instant Client tests skipped without OCI_HOME)
 uv run pytest      # end-to-end and benchmark harness tests (Oracle required)
 ```
 

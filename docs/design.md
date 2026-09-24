@@ -28,7 +28,7 @@ The project ships:
 - An `oraduck` DuckDB secret type holding the Oracle credentials.
 - Parallel load: one OCI Direct Path session per DuckDB thread.
 - The scalar types listed in section 5.
-- DuckDB pinned to a stable release, Oracle Instant Client 19. Prebuilt for Linux
+- DuckDB pinned to a stable release, Oracle Instant Client 19 or later. Prebuilt for Linux
   x86_64 and arm64 and Windows x86_64 (CI: build and tests without Oracle);
   tested against Oracle and benchmarked on Linux x86_64 only.
 
@@ -118,6 +118,7 @@ is rejected: DuckDB would otherwise replace it with a temporary file.
 |---------------------|----------------|
 | `OraduckExtension`  | Entry point: registers the secret type and the `oraduck` copy function. |
 | Secret type         | Declares the `oraduck` type, validates its keys, redacts the password. |
+| `OciApi`            | The OCI functions OraDuck calls, loaded at run time from Instant Client (`dlopen` of `libclntsh.so`, `LoadLibrary` of `oci.dll`) on first use, with a clear error when it is missing. OraDuck declares the few OCI types, constants and signatures it needs: building needs no Oracle SDK. |
 | `CreateOciEnv`      | Creates an OCI environment (`OCIEnvNlsCreate`, threaded mode, AL32UTF8 charset id 873). **One environment per session**: concurrent handle allocations on a shared environment corrupt its heap (ORA-21500 KGHALO4, SIGSEGV), even with `OCI_THREADED`. |
 | `OciSession`        | OCI connection and session (environment, error handle, service context). RAII. |
 | `DescribeTarget`    | Resolves `SCHEMA.TABLE` and describes its columns (name, type, size, precision, scale, nullability, index count). |
@@ -241,21 +242,23 @@ at bind time with an explicit message.
 - The benchmark harness and the end-to-end tests drive the **DuckDB CLI built
   with the extension** (`build/release/duckdb`). The Python `duckdb` package is
   not used: loading a locally built C++ extension into a Python wheel risks C++
-  ABI mismatches.
-- Oracle Instant Client 19.32: Basic, SDK (`oci.h` headers), Tools (`sqlldr`),
-  downloaded from oracle.com into `.deps/` (ignored by git).
-- The extension links dynamically against `libclntsh.so`; `LD_LIBRARY_PATH`
-  must contain the Instant Client directory when DuckDB loads it.
-- System dependencies: `libaio`, `libnsl`.
+  ABI mismatches. The extension built by the CI (manylinux toolchain, like
+  DuckDB's) loads in the Python package (checked with duckdb 1.5.5 from PyPI).
+- OCI is loaded at run time (`OciApi`): the build needs no Oracle software, and
+  the extension loads without Instant Client; the first function that talks to
+  Oracle loads `libclntsh.so` (Linux: `LD_LIBRARY_PATH`), `oci.dll` (Windows:
+  `PATH`) or `libclntsh.dylib`, Instant Client 19 or later.
+- Oracle Instant Client 19.32 for the tests and the benchmark: Basic, Tools
+  (`sqlldr`), downloaded from oracle.com into `.deps/` (ignored by git).
+- Run-time dependencies of Instant Client on Linux: `libaio`, `libnsl`.
 - Distribution (`.github/workflows/build.yml`): Linux builds run in the
   `manylinux_2_28` containers (glibc 2.28, like DuckDB's own builds), Windows
-  builds use MSVC and link `oci.lib`. The CI runs the unit tests and the
-  sqllogictest, which need no Oracle database. A `v*` tag publishes a DuckDB
+  builds use MSVC. The CI runs the unit tests and the sqllogictest, first
+  without Instant Client (as DuckDB's community CI does), then with it; none
+  needs an Oracle database. A `v*` tag publishes a DuckDB
   extension repository on GitHub Pages
   (`v1.5.5/<platform>/oraduck.duckdb_extension.gz`) and a release holding the
-  same tree as `oraduck-repository.tar.gz`, for offline installs. The shipped
-  extension has no run path: Instant Client is found through `LD_LIBRARY_PATH`
-  or `PATH`.
+  same tree as `oraduck-repository.tar.gz`, for offline installs.
 
 ## 8. Benchmark infrastructure
 
@@ -427,8 +430,9 @@ mixed-case identifiers.
 
 ### 10.3 sqllogictest (no Oracle)
 
-- `LOAD` of the extension, secret creation and redaction.
+- `LOAD` of the extension, secret creation and redaction, without Instant Client.
 - Errors: missing `CONNECTION`, unknown secret, unknown option, `COPY FROM`.
+- Instant Client version, only when `OCI_HOME` is set (`require-env`).
 
 ### 10.4 End-to-end tests (pytest, Oracle required)
 
@@ -437,6 +441,8 @@ mixed-case identifiers.
 - NULLs, multi-byte Unicode (é, 漢字, emoji), empty strings, short inlined
   strings, constant and dictionary vectors, empty source.
 - Parallel load (`threads = 8`, several million rows): row count and checksums.
+- Without Instant Client: the extension loads and creates secrets;
+  `oraduck_oci_version()` and COPY report that Instant Client is missing.
 - Errors: missing table or column, incompatible or unsupported type, indexed
   table, wrong password, value too long, NULL in a NOT NULL column, dates out of
   range, NaN into NUMBER, a local file named like the target, file options,

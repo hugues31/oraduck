@@ -1,10 +1,10 @@
 # name: test/sql/oraduck.test
-# description: OraDuck extension loading and OCI linkage
+# description: OraDuck loads without Oracle Instant Client (OCI is loaded on first use)
 # group: [oraduck]
 
 require oraduck
 
 query I
-SELECT oraduck_oci_version() LIKE '19.32.%';
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'oraduck_oci_version';
 ----
-true
+1

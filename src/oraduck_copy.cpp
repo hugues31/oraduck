@@ -70,7 +70,7 @@ unique_ptr<FunctionData> OraduckBind(ClientContext &context, CopyFunctionBindInp
 			if (size < kMinStreamSize || size > kMaxStreamSize) {
 				throw BinderException("OraDuck: STREAM_SIZE must be between 65536 and 268435456 bytes");
 			}
-			result->loader_options.stream_buffer_bytes = static_cast<ub4>(size);
+			result->loader_options.stream_buffer_bytes = static_cast<oraduck::ub4>(size);
 		}
 	}
 	if (secret_name.empty()) {
@@ -151,10 +151,10 @@ void OraduckSink(ExecutionContext &, FunctionData &bind_p, GlobalFunctionData &,
 		for (idx_t offset = 0; offset < count; offset += capacity) {
 			const idx_t n = MinValue<idx_t>(capacity, count - offset);
 			for (idx_t i = 0; i < bind.plan.size(); i++) {
-				oraduck::WriteColumn(bind.plan[i], static_cast<ub2>(i), state.formats[i], offset, n,
+				oraduck::WriteColumn(bind.plan[i], static_cast<oraduck::ub2>(i), state.formats[i], offset, n,
 				                      state.scratch[i].data(), loader);
 			}
-			loader.ConvertAndLoad(static_cast<ub4>(n));
+			loader.ConvertAndLoad(static_cast<oraduck::ub4>(n));
 		}
 	} catch (const oraduck::OraduckError &e) {
 		throw IOException("OraDuck: " + string(e.what()));

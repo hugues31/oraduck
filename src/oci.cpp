@@ -9,9 +9,9 @@ constexpr ub2 kAl32Utf8 = 873;
 OCIEnv *CreateOciEnv() {
 	OCIEnv *env = nullptr;
 	const sword rc =
-	    OCIEnvNlsCreate(&env, OCI_THREADED, nullptr, nullptr, nullptr, nullptr, 0, nullptr, kAl32Utf8, kAl32Utf8);
+	    Oci().OCIEnvNlsCreate(&env, OCI_THREADED, nullptr, nullptr, nullptr, nullptr, 0, nullptr, kAl32Utf8, kAl32Utf8);
 	if (rc != OCI_SUCCESS || env == nullptr) {
-		throw OracleError("cannot create the OCI environment (Instant Client missing from LD_LIBRARY_PATH?)", 0);
+		throw OracleError("cannot create the OCI environment", 0);
 	}
 	return env;
 }
@@ -35,7 +35,7 @@ std::string OciErrorText(OCIError *err, sword status, int32_t &ora_code) {
 	}
 	OraText buffer[3072];
 	sb4 code = 0;
-	if (OCIErrorGet(err, 1, nullptr, &code, buffer, sizeof(buffer), OCI_HTYPE_ERROR) != OCI_SUCCESS) {
+	if (Oci().OCIErrorGet(err, 1, nullptr, &code, buffer, sizeof(buffer), OCI_HTYPE_ERROR) != OCI_SUCCESS) {
 		return "OCI error " + std::to_string(status) + " (no text available)";
 	}
 	ora_code = code;

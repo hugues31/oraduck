@@ -9,7 +9,7 @@ struct StmtGuard {
 	OCIError *err;
 	~StmtGuard() {
 		if (stmt) {
-			OCIStmtRelease(stmt, err, nullptr, 0, OCI_DEFAULT);
+			Oci().OCIStmtRelease(stmt, err, nullptr, 0, OCI_DEFAULT);
 		}
 	}
 };
@@ -21,20 +21,20 @@ const OraText *Text(const std::string &value) {
 } // namespace
 
 OciSession::OciSession(const OracleCredentials &credentials) : env_(CreateOciEnv()) {
-	const sword alloc = OCIHandleAlloc(env_, reinterpret_cast<void **>(&err_), OCI_HTYPE_ERROR, 0, nullptr);
+	const sword alloc = Oci().OCIHandleAlloc(env_, reinterpret_cast<void **>(&err_), OCI_HTYPE_ERROR, 0, nullptr);
 	if (alloc != OCI_SUCCESS) {
-		OCIHandleFree(env_, OCI_HTYPE_ENV);
-		throw OracleError("OCIHandleAlloc(OCIError): OCI error " + std::to_string(alloc), 0);
+		Oci().OCIHandleFree(env_, OCI_HTYPE_ENV);
+		throw OracleError("Oci().OCIHandleAlloc(OCIError): OCI error " + std::to_string(alloc), 0);
 	}
-	const sword rc = OCILogon2(env_, err_, &svc_, Text(credentials.user), static_cast<ub4>(credentials.user.size()),
+	const sword rc = Oci().OCILogon2(env_, err_, &svc_, Text(credentials.user), static_cast<ub4>(credentials.user.size()),
 	                           Text(credentials.password), static_cast<ub4>(credentials.password.size()),
 	                           Text(credentials.dsn), static_cast<ub4>(credentials.dsn.size()), OCI_DEFAULT);
 	if (rc != OCI_SUCCESS && rc != OCI_SUCCESS_WITH_INFO) {
 		int32_t code = 0;
 		const std::string text = OciErrorText(err_, rc, code);
-		OCIHandleFree(err_, OCI_HTYPE_ERROR);
+		Oci().OCIHandleFree(err_, OCI_HTYPE_ERROR);
 		err_ = nullptr;
-		OCIHandleFree(env_, OCI_HTYPE_ENV);
+		Oci().OCIHandleFree(env_, OCI_HTYPE_ENV);
 		env_ = nullptr;
 		throw OracleError("cannot connect to Oracle (" + credentials.user + "@" + credentials.dsn + "): " + text,
 		                  code);
@@ -43,33 +43,33 @@ OciSession::OciSession(const OracleCredentials &credentials) : env_(CreateOciEnv
 
 OciSession::~OciSession() {
 	if (svc_) {
-		OCILogoff(svc_, err_);
+		Oci().OCILogoff(svc_, err_);
 	}
 	if (err_) {
-		OCIHandleFree(err_, OCI_HTYPE_ERROR);
+		Oci().OCIHandleFree(err_, OCI_HTYPE_ERROR);
 	}
 	if (env_) {
-		OCIHandleFree(env_, OCI_HTYPE_ENV);
+		Oci().OCIHandleFree(env_, OCI_HTYPE_ENV);
 	}
 }
 
 std::vector<std::vector<std::string>> OciSession::QueryStrings(const std::string &sql,
                                                                const std::vector<std::string> &binds) {
 	OCIStmt *stmt = nullptr;
-	CheckOci(OCIStmtPrepare2(svc_, &stmt, err_, Text(sql), static_cast<ub4>(sql.size()), nullptr, 0, OCI_NTV_SYNTAX,
+	CheckOci(Oci().OCIStmtPrepare2(svc_, &stmt, err_, Text(sql), static_cast<ub4>(sql.size()), nullptr, 0, OCI_NTV_SYNTAX,
 	                         OCI_DEFAULT),
 	         err_, "OCIStmtPrepare2");
 	StmtGuard guard {stmt, err_};
 	for (size_t i = 0; i < binds.size(); i++) {
 		OCIBind *bind = nullptr;
-		CheckOci(OCIBindByPos(stmt, &bind, err_, static_cast<ub4>(i + 1), const_cast<char *>(binds[i].data()),
+		CheckOci(Oci().OCIBindByPos(stmt, &bind, err_, static_cast<ub4>(i + 1), const_cast<char *>(binds[i].data()),
 		                      static_cast<sb4>(binds[i].size()), SQLT_CHR, nullptr, nullptr, nullptr, 0, nullptr,
 		                      OCI_DEFAULT),
 		         err_, "OCIBindByPos");
 	}
-	CheckOci(OCIStmtExecute(svc_, stmt, err_, 0, 0, nullptr, nullptr, OCI_DEFAULT), err_, "OCIStmtExecute");
+	CheckOci(Oci().OCIStmtExecute(svc_, stmt, err_, 0, 0, nullptr, nullptr, OCI_DEFAULT), err_, "OCIStmtExecute");
 	ub4 ncols = 0;
-	CheckOci(OCIAttrGet(stmt, OCI_HTYPE_STMT, &ncols, nullptr, OCI_ATTR_PARAM_COUNT, err_), err_,
+	CheckOci(Oci().OCIAttrGet(stmt, OCI_HTYPE_STMT, &ncols, nullptr, OCI_ATTR_PARAM_COUNT, err_), err_,
 	         "OCI_ATTR_PARAM_COUNT");
 	constexpr sb4 kWidth = 4001;
 	std::vector<std::vector<char>> buffers(ncols, std::vector<char>(kWidth));
@@ -77,13 +77,13 @@ std::vector<std::vector<std::string>> OciSession::QueryStrings(const std::string
 	std::vector<ub2> lengths(ncols);
 	for (ub4 c = 0; c < ncols; c++) {
 		OCIDefine *define = nullptr;
-		CheckOci(OCIDefineByPos(stmt, &define, err_, c + 1, buffers[c].data(), kWidth, SQLT_CHR, &indicators[c],
+		CheckOci(Oci().OCIDefineByPos(stmt, &define, err_, c + 1, buffers[c].data(), kWidth, SQLT_CHR, &indicators[c],
 		                        &lengths[c], nullptr, OCI_DEFAULT),
 		         err_, "OCIDefineByPos");
 	}
 	std::vector<std::vector<std::string>> rows;
 	while (true) {
-		const sword rc = OCIStmtFetch2(stmt, err_, 1, OCI_FETCH_NEXT, 0, OCI_DEFAULT);
+		const sword rc = Oci().OCIStmtFetch2(stmt, err_, 1, OCI_FETCH_NEXT, 0, OCI_DEFAULT);
 		if (rc == OCI_NO_DATA) {
 			break;
 		}
@@ -100,17 +100,17 @@ std::vector<std::vector<std::string>> OciSession::QueryStrings(const std::string
 
 void OciSession::Execute(const std::string &sql) {
 	OCIStmt *stmt = nullptr;
-	CheckOci(OCIStmtPrepare2(svc_, &stmt, err_, Text(sql), static_cast<ub4>(sql.size()), nullptr, 0, OCI_NTV_SYNTAX,
+	CheckOci(Oci().OCIStmtPrepare2(svc_, &stmt, err_, Text(sql), static_cast<ub4>(sql.size()), nullptr, 0, OCI_NTV_SYNTAX,
 	                         OCI_DEFAULT),
 	         err_, "OCIStmtPrepare2");
 	StmtGuard guard {stmt, err_};
-	const sword rc = OCIStmtExecute(svc_, stmt, err_, 1, 0, nullptr, nullptr, OCI_DEFAULT);
+	const sword rc = Oci().OCIStmtExecute(svc_, stmt, err_, 1, 0, nullptr, nullptr, OCI_DEFAULT);
 	if (rc != OCI_SUCCESS && rc != OCI_SUCCESS_WITH_INFO) {
 		int32_t code = 0;
 		const std::string text = OciErrorText(err_, rc, code);
 		throw OracleError("failed \"" + sql.substr(0, 120) + "\": " + text, code);
 	}
-	CheckOci(OCITransCommit(svc_, err_, OCI_DEFAULT), err_, "OCITransCommit");
+	CheckOci(Oci().OCITransCommit(svc_, err_, OCI_DEFAULT), err_, "OCITransCommit");
 }
 
 } // namespace oraduck

@@ -2,7 +2,7 @@
 
 #include "oraduck/errors.hpp"
 
-#include <oci.h>
+#include "oraduck/oci_api.hpp"
 
 #include <string>
 

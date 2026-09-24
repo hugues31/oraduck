@@ -9,23 +9,16 @@ project(${TARGET_NAME})
 set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(NOT DEFINED ENV{OCI_HOME})
-  message(FATAL_ERROR "OCI_HOME is not set: run 'source env.sh' (Instant Client 19 with its SDK)")
-endif()
-file(TO_CMAKE_PATH "$ENV{OCI_HOME}" OCI_HOME)
-if(WIN32)
-  set(OCI_LIBRARY ${OCI_HOME}/sdk/lib/msvc/oci.lib)
-else()
-  set(OCI_LIBRARY ${OCI_HOME}/libclntsh.so)
-endif()
-
-include_directories(src/include ${OCI_HOME}/sdk/include)
+# OCI is loaded at run time from Oracle Instant Client (src/oci_api.cpp): no Oracle SDK or library
+# is needed to build
+include_directories(src/include)
 
 set(EXTENSION_SOURCES
     src/oraduck_extension.cpp
     src/oraduck_secret.cpp
     src/oracle_encoding.cpp
     src/oracle_names.cpp
+    src/oci_api.cpp
     src/oci.cpp
     src/oci_session.cpp
     src/describe_target.cpp
@@ -41,14 +34,13 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 set_target_properties(${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 
 if(WIN32)
-  # oci.h includes windows.h
+  # oci_api.cpp includes windows.h
   target_compile_definitions(${EXTENSION_NAME} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+else()
+  target_link_libraries(${EXTENSION_NAME} ${CMAKE_DL_LIBS})
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} ${CMAKE_DL_LIBS})
 endif()
-target_link_libraries(${EXTENSION_NAME} ${OCI_LIBRARY})
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ${OCI_LIBRARY})
-# Instant Client is found at load time (LD_LIBRARY_PATH or PATH): no build path in the shipped extension
-set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES SKIP_BUILD_RPATH ON)
 
 install(
   TARGETS ${EXTENSION_NAME}

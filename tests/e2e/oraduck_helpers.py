@@ -26,7 +26,8 @@ def secret_sql(name: str = "ora") -> str:
     )
 
 
-def run_duckdb(sql: str, db: str = ":memory:", timeout: float = 600) -> subprocess.CompletedProcess[str]:
+def run_duckdb(sql: str, db: str = ":memory:", timeout: float = 600,
+               env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     """Runs a script in the DuckDB CLI; does not raise on SQL failure."""
     WORKDIR.mkdir(parents=True, exist_ok=True)
     return subprocess.run(
@@ -36,6 +37,7 @@ def run_duckdb(sql: str, db: str = ":memory:", timeout: float = 600) -> subproce
         capture_output=True,
         cwd=WORKDIR,
         timeout=timeout,
+        env=env,
     )
 
 

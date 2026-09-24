@@ -1,0 +1,12 @@
+# name: test/sql/oraduck_instant_client.test
+# description: Instant Client loaded at run time (OCI_HOME is set by env.sh and the CI)
+# group: [oraduck]
+
+require oraduck
+
+require-env OCI_HOME
+
+query I
+SELECT oraduck_oci_version() LIKE '19.32.%';
+----
+true
