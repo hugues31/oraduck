@@ -96,6 +96,7 @@ The COPY "file path" is read as an Oracle table name:
 |---------------|------------------|---------|
 | `CONNECTION`  | — (required)     | Name of an `oraduck` secret |
 | `STREAM_SIZE` | 4 MiB            | Size in bytes of the direct path stream buffer per session (64 KiB to 256 MiB) |
+| `SKIP_INDEX_MAINTENANCE` | false  | Accept an indexed table and leave its indexes `UNUSABLE` (6.4) |
 
 The OCI column array holds 2,048 rows (the DuckDB vector size): one DuckDB
 DataChunk fills it exactly, without copying strings. The probe (section 11)
@@ -231,8 +232,21 @@ A DuckDB interrupt (Ctrl-C) aborts the sessions as in 6.1.
 ### 6.4 Indexes
 
 Parallel direct path loads do not maintain indexes (ORA-26002, the same
-restriction as `sqlldr parallel=true`). OraDuck rejects an indexed target table
-at bind time with an explicit message.
+restriction as `sqlldr parallel=true`). By default OraDuck rejects an indexed
+target table at bind time, with a message that names the option below.
+
+`SKIP_INDEX_MAINTENANCE true` is the equivalent of `sqlldr skip_index_maintenance=true`:
+every session sets `OCI_ATTR_DIRPATH_SKIPINDEX_METHOD` to
+`OCI_DIRPATH_INDEX_MAINT_SKIP_ALL`, the parallel load proceeds and Oracle marks
+the table's indexes `UNUSABLE`; the user rebuilds them (`ALTER INDEX … REBUILD`).
+Measured on Oracle 19c, identical for sqlldr and OCI: the rows are loaded, the
+indexes are `UNUSABLE`, a rebuild makes them `VALID`; with duplicate keys, the
+rebuild of a unique index fails (ORA-01452) and the rows stay loaded.
+
+A serial direct path load (`OCI_ATTR_DIRPATH_PARALLEL = FALSE`, like
+`sqlldr direct=true` without `parallel`) maintains the indexes itself; it is
+not offered: it gives up the parallel sessions, and a unique index still ends
+`UNUSABLE` without any error when the rows contain duplicate keys.
 
 ## 7. Build and dependencies
 
@@ -426,7 +440,8 @@ Session, queries and table description; direct path loader: small stream
 buffers (`OCI_CONTINUE`), stream accumulation on and off, the `EntrySet`
 fallback, explicit and implicit abort, parallel sessions on one table,
 concurrent loader creation, values too long, rows wider than the stream buffer,
-mixed-case identifiers.
+mixed-case identifiers, an indexed table (ORA-26002, then loaded with index
+maintenance skipped).
 
 ### 10.3 sqllogictest (no Oracle)
 
@@ -443,8 +458,10 @@ mixed-case identifiers.
 - Parallel load (`threads = 8`, several million rows): row count and checksums.
 - Without Instant Client: the extension loads and creates secrets;
   `oraduck_oci_version()` and COPY report that Instant Client is missing.
-- Errors: missing table or column, incompatible or unsupported type, indexed
-  table, wrong password, value too long, NULL in a NOT NULL column, dates out of
+- Indexed table: refused (the message names `SKIP_INDEX_MAINTENANCE`); with
+  `SKIP_INDEX_MAINTENANCE true` and 8 threads, all rows loaded, a plain and a
+  unique index left `UNUSABLE`, then `VALID` after `ALTER INDEX … REBUILD`.
+- Errors: missing table or column, incompatible or unsupported type, wrong password, value too long, NULL in a NOT NULL column, dates out of
   range, NaN into NUMBER, a local file named like the target, file options,
   invalid `STREAM_SIZE`. For load errors, the table must be empty afterwards.
 - Benchmark harness: both methods must load identical data (row by row
@@ -464,7 +481,8 @@ accepts and what they cost. Results and decisions are in
 - stream accumulation: 16 % faster; stream buffer: 4 MiB;
 - parallel sessions: 1 → 4 sessions divides the time by 2.4, flat beyond;
 - identifiers must be double-quoted (ORA-39826 otherwise);
-- indexed tables fail with ORA-26002;
+- indexed tables fail with ORA-26002 in parallel mode (see 6.4 for
+  `SKIP_INDEX_MAINTENANCE`);
 - all 29 encoder reference values match `DUMP()`.
 
 ## 12. Repository layout

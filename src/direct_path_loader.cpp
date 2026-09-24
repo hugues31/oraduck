@@ -36,12 +36,17 @@ DirectPathLoader::DirectPathLoader(const OracleCredentials &credentials, const s
 	OCIError *err = session_.err();
 	try {
 		CheckOci(Oci().OCIHandleAlloc(session_.env(), reinterpret_cast<void **>(&ctx_), OCI_HTYPE_DIRPATH_CTX, 0, nullptr),
-		         err, "Oci().OCIHandleAlloc(DIRPATH_CTX)");
+		         err, "OCIHandleAlloc(DIRPATH_CTX)");
 		SetTextAttr(ctx_, OCI_HTYPE_DIRPATH_CTX, table_, OCI_ATTR_NAME, err, "OCI_ATTR_NAME (table)");
 		SetTextAttr(ctx_, OCI_HTYPE_DIRPATH_CTX, owner_, OCI_ATTR_SCHEMA_NAME, err, "OCI_ATTR_SCHEMA_NAME");
 		ub1 parallel = options_.parallel ? 1 : 0;
 		CheckOci(Oci().OCIAttrSet(ctx_, OCI_HTYPE_DIRPATH_CTX, &parallel, 0, OCI_ATTR_DIRPATH_PARALLEL, err), err,
 		         "OCI_ATTR_DIRPATH_PARALLEL");
+		if (options_.skip_index_maintenance) {
+			ub1 skip = OCI_DIRPATH_INDEX_MAINT_SKIP_ALL;
+			CheckOci(Oci().OCIAttrSet(ctx_, OCI_HTYPE_DIRPATH_CTX, &skip, 0, OCI_ATTR_DIRPATH_SKIPINDEX_METHOD, err),
+			         err, "OCI_ATTR_DIRPATH_SKIPINDEX_METHOD");
+		}
 		ub4 buffer = options_.stream_buffer_bytes;
 		CheckOci(Oci().OCIAttrSet(ctx_, OCI_HTYPE_DIRPATH_CTX, &buffer, 0, OCI_ATTR_BUF_SIZE, err), err,
 		         "OCI_ATTR_BUF_SIZE");
@@ -57,7 +62,7 @@ DirectPathLoader::DirectPathLoader(const OracleCredentials &credentials, const s
 			OCIParam *column = nullptr;
 			CheckOci(Oci().OCIParamGet(column_list, OCI_DTYPE_PARAM, err, reinterpret_cast<void **>(&column),
 			                     static_cast<ub4>(i + 1)),
-			         err, "Oci().OCIParamGet(column)");
+			         err, "OCIParamGet(column)");
 			SetTextAttr(column, OCI_DTYPE_PARAM, column_names_[i], OCI_ATTR_NAME, err, "OCI_ATTR_NAME (column)");
 			ub2 type = columns[i].external_type;
 			CheckOci(Oci().OCIAttrSet(column, OCI_DTYPE_PARAM, &type, 0, OCI_ATTR_DATA_TYPE, err), err,
@@ -74,9 +79,9 @@ DirectPathLoader::DirectPathLoader(const OracleCredentials &credentials, const s
 
 		CheckOci(Oci().OCIDirPathPrepare(ctx_, session_.svc(), err), err, "OCIDirPathPrepare");
 		CheckOci(Oci().OCIHandleAlloc(ctx_, reinterpret_cast<void **>(&ca_), OCI_HTYPE_DIRPATH_COLUMN_ARRAY, 0, nullptr), err,
-		         "Oci().OCIHandleAlloc(COLUMN_ARRAY)");
+		         "OCIHandleAlloc(COLUMN_ARRAY)");
 		CheckOci(Oci().OCIHandleAlloc(ctx_, reinterpret_cast<void **>(&stream_), OCI_HTYPE_DIRPATH_STREAM, 0, nullptr), err,
-		         "Oci().OCIHandleAlloc(STREAM)");
+		         "OCIHandleAlloc(STREAM)");
 		CheckOci(Oci().OCIAttrGet(ca_, OCI_HTYPE_DIRPATH_COLUMN_ARRAY, &rows_, nullptr, OCI_ATTR_NUM_ROWS, err), err,
 		         "OCI_ATTR_NUM_ROWS (column array)");
 		CheckOci(Oci().OCIAttrGet(ca_, OCI_HTYPE_DIRPATH_COLUMN_ARRAY, &ncols_, nullptr, OCI_ATTR_NUM_COLS, err), err,
@@ -101,9 +106,9 @@ void DirectPathLoader::DetectContiguousArrays() {
 	ub1 **v0 = nullptr, **v1 = nullptr, **vl = nullptr;
 	ub4 *l0 = nullptr, *l1 = nullptr, *ll = nullptr;
 	ub1 *f0 = nullptr, *f1 = nullptr, *fl = nullptr;
-	CheckOci(Oci().OCIDirPathColArrayRowGet(ca_, err, 0, &v0, &l0, &f0), err, "Oci().OCIDirPathColArrayRowGet(0)");
-	CheckOci(Oci().OCIDirPathColArrayRowGet(ca_, err, 1, &v1, &l1, &f1), err, "Oci().OCIDirPathColArrayRowGet(1)");
-	CheckOci(Oci().OCIDirPathColArrayRowGet(ca_, err, rows_ - 1, &vl, &ll, &fl), err, "Oci().OCIDirPathColArrayRowGet(n-1)");
+	CheckOci(Oci().OCIDirPathColArrayRowGet(ca_, err, 0, &v0, &l0, &f0), err, "OCIDirPathColArrayRowGet(0)");
+	CheckOci(Oci().OCIDirPathColArrayRowGet(ca_, err, 1, &v1, &l1, &f1), err, "OCIDirPathColArrayRowGet(1)");
+	CheckOci(Oci().OCIDirPathColArrayRowGet(ca_, err, rows_ - 1, &vl, &ll, &fl), err, "OCIDirPathColArrayRowGet(n-1)");
 	const size_t last = size_t(rows_ - 1) * ncols_;
 	contiguous_ = v1 == v0 + ncols_ && l1 == l0 + ncols_ && f1 == f0 + ncols_ && vl == v0 + last &&
 	              ll == l0 + last && fl == f0 + last;

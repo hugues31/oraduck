@@ -30,12 +30,6 @@ def test_unsupported_type(table, expr):
     assert "unsupported" in copy_error(f"SELECT {expr} AS c", table.name)
 
 
-def test_indexed_table(table):
-    table.create("ID NUMBER")
-    table.execute(f"CREATE INDEX {table.name}_IX ON {table.name} (ID)")
-    assert "index" in copy_error("SELECT 1 AS id", table.name)
-
-
 def test_wrong_password(table):
     table.create("ID NUMBER")
     setup = (

@@ -26,3 +26,14 @@ statement error
 COPY t FROM 'BENCH.T' (FORMAT oraduck);
 ----
 not supported
+
+# SKIP_INDEX_MAINTENANCE is a known boolean option (checked before connecting)
+statement error
+COPY (SELECT 1 AS id) TO 'BENCH.T' (FORMAT oraduck, CONNECTION 'absent', SKIP_INDEX_MAINTENANCE true);
+----
+not found
+
+statement error
+COPY (SELECT 1 AS id) TO 'BENCH.T' (FORMAT oraduck, CONNECTION 'absent', SKIP_INDEX_MAINTENANCE 'maybe');
+----
+BOOL

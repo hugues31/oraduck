@@ -24,7 +24,7 @@ OciSession::OciSession(const OracleCredentials &credentials) : env_(CreateOciEnv
 	const sword alloc = Oci().OCIHandleAlloc(env_, reinterpret_cast<void **>(&err_), OCI_HTYPE_ERROR, 0, nullptr);
 	if (alloc != OCI_SUCCESS) {
 		Oci().OCIHandleFree(env_, OCI_HTYPE_ENV);
-		throw OracleError("Oci().OCIHandleAlloc(OCIError): OCI error " + std::to_string(alloc), 0);
+		throw OracleError("OCIHandleAlloc(OCIError): OCI error " + std::to_string(alloc), 0);
 	}
 	const sword rc = Oci().OCILogon2(env_, err_, &svc_, Text(credentials.user), static_cast<ub4>(credentials.user.size()),
 	                           Text(credentials.password), static_cast<ub4>(credentials.password.size()),

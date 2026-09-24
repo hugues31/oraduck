@@ -134,8 +134,28 @@ name (exact match first, then case-insensitive).
 |---|---|---|
 | `CONNECTION` | required | name of an `oraduck` secret |
 | `STREAM_SIZE` | 4 MiB | direct path stream buffer per session (65536 to 268435456 bytes) |
+| `SKIP_INDEX_MAINTENANCE` | false | load a table that has indexes and leave them `UNUSABLE`, like `sqlldr skip_index_maintenance=true` |
 
 The number of Oracle sessions follows `SET threads = N`.
+
+### Tables with indexes
+
+Parallel direct path loads cannot maintain indexes (ORA-26002, as with
+`sqlldr parallel=true`): an indexed table is refused unless
+`SKIP_INDEX_MAINTENANCE true` is set. The load then runs at full speed and
+leaves every index of the table `UNUSABLE`; rebuild them afterwards:
+
+```sql
+COPY (SELECT ...) TO 'MY_SCHEMA.MY_TABLE'
+(FORMAT oraduck, CONNECTION 'oracle_test', SKIP_INDEX_MAINTENANCE true);
+-- in Oracle:
+ALTER INDEX MY_SCHEMA.MY_TABLE_IX REBUILD PARALLEL 8;
+```
+
+Until it is rebuilt, an unusable index is ignored by queries, but a unique
+index (or a primary key) blocks inserts into the table (ORA-01502). If the
+loaded rows contain duplicate keys, rebuilding a unique index fails
+(ORA-01452): the rows are loaded and must be fixed first.
 
 ### Types
 
@@ -150,8 +170,8 @@ Any other type is rejected at bind time: convert it with `CAST`.
 
 ## Behavior and limitations
 
-- The target table must exist and must **not have indexes** (parallel direct
-  path loads do not maintain them, ORA-26002). OraDuck does not run DDL.
+- The target table must exist; OraDuck does not run DDL. A table with indexes
+  needs `SKIP_INDEX_MAINTENANCE true` (see above).
 - Oracle columns missing from the query receive NULL; a missing `NOT NULL`
   column is an error.
 - Nothing is visible before the end of the COPY and any error aborts every

@@ -150,6 +150,33 @@ TEST_CASE("Parallel sessions on the same table", "[oracle][dirpath]") {
 	CHECK(f.Stats() == Expected(kSessions * kPerSession));
 }
 
+TEST_CASE("Indexed table: refused in parallel, loaded with index maintenance skipped", "[oracle][dirpath]") {
+	Fixture f;
+	f.session.Execute("CREATE INDEX ITEST_DP_IX ON ITEST_DP (ID)");
+	try {
+		DirectPathLoader refused(TestCredentials(), "BENCH", kTable, Specs(), LoaderOptions {});
+		FAIL("parallel direct path load accepted an indexed table");
+	} catch (const OracleError &e) {
+		CHECK(e.ora_code == 26002);
+	}
+
+	LoaderOptions options;
+	options.skip_index_maintenance = true; // sqlldr skip_index_maintenance=true
+	std::vector<std::unique_ptr<DirectPathLoader>> loaders;
+	for (int i = 0; i < 2; i++) {
+		loaders.push_back(std::make_unique<DirectPathLoader>(TestCredentials(), "BENCH", kTable, Specs(), options));
+	}
+	LoadRange(*loaders[0], 0, 3000);
+	LoadRange(*loaders[1], 3000, 3000);
+	for (auto &loader : loaders) {
+		loader->Finish();
+	}
+	CHECK(f.Stats() == Expected(6000));
+	CHECK(Scalar(f.session, "SELECT status FROM user_indexes WHERE index_name = 'ITEST_DP_IX'") == "UNUSABLE");
+	f.session.Execute("ALTER INDEX ITEST_DP_IX REBUILD");
+	CHECK(Scalar(f.session, "SELECT status FROM user_indexes WHERE index_name = 'ITEST_DP_IX'") == "VALID");
+}
+
 TEST_CASE("Value too long", "[oracle][dirpath]") {
 	Fixture f;
 	DirectPathLoader loader(TestCredentials(), "BENCH", kTable, Specs(), LoaderOptions {});

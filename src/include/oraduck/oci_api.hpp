@@ -71,6 +71,10 @@ constexpr ub4 OCI_ATTR_NUM_ROWS = 81;
 constexpr ub4 OCI_ATTR_COL_COUNT = 82;
 constexpr ub4 OCI_ATTR_NUM_COLS = 102;
 constexpr ub4 OCI_ATTR_LIST_COLUMNS = 103;
+constexpr ub4 OCI_ATTR_DIRPATH_SKIPINDEX_METHOD = 145;
+
+// Values of OCI_ATTR_DIRPATH_SKIPINDEX_METHOD
+constexpr ub1 OCI_DIRPATH_INDEX_MAINT_SKIP_ALL = 4; // sqlldr skip_index_maintenance=true: indexes left unusable
 
 // Direct path column flags
 constexpr ub1 OCI_DIRPATH_COL_COMPLETE = 0;

@@ -19,6 +19,9 @@ struct LoaderOptions {
 	ub4 stream_buffer_bytes = 4u << 20; // OCI_ATTR_BUF_SIZE (best probe result, E4)
 	ub4 column_array_rows = 2048;       // requested OCI_ATTR_NUM_ROWS
 	bool parallel = true;               // OCI_ATTR_DIRPATH_PARALLEL
+	// Skips index maintenance (sqlldr skip_index_maintenance=true): a parallel load then accepts indexed
+	// tables and leaves their indexes UNUSABLE, to be rebuilt afterwards
+	bool skip_index_maintenance = false;
 	bool accumulate_stream = true;      // convert several column arrays into one stream before sending it (E3: 16 % faster)
 	bool force_entry_set = false;       // tests: ignore direct access to contiguous column arrays
 };

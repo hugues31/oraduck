@@ -35,7 +35,9 @@ struct OraduckBindData : public FunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<OraduckBindData>();
 		return credentials.dsn == other.credentials.dsn && credentials.user == other.credentials.user &&
-		       table.owner == other.table.owner && table.table == other.table.table;
+		       table.owner == other.table.owner && table.table == other.table.table &&
+		       loader_options.stream_buffer_bytes == other.loader_options.stream_buffer_bytes &&
+		       loader_options.skip_index_maintenance == other.loader_options.skip_index_maintenance;
 	}
 };
 
@@ -54,6 +56,7 @@ struct OraduckLocalState : public LocalFunctionData {
 void OraduckCopyOptions(ClientContext &, CopyOptionsInput &input) {
 	input.options["connection"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::WRITE_ONLY);
 	input.options["stream_size"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
+	input.options["skip_index_maintenance"] = CopyOption(LogicalType::BOOLEAN, CopyOptionMode::WRITE_ONLY);
 }
 
 unique_ptr<FunctionData> OraduckBind(ClientContext &context, CopyFunctionBindInput &input,
@@ -71,6 +74,9 @@ unique_ptr<FunctionData> OraduckBind(ClientContext &context, CopyFunctionBindInp
 				throw BinderException("OraDuck: STREAM_SIZE must be between 65536 and 268435456 bytes");
 			}
 			result->loader_options.stream_buffer_bytes = static_cast<oraduck::ub4>(size);
+		} else if (key == "skip_index_maintenance") {
+			result->loader_options.skip_index_maintenance = option.second.empty() || BooleanValue::Get(
+			                                                    option.second[0].DefaultCastAs(LogicalType::BOOLEAN));
 		}
 	}
 	if (secret_name.empty()) {
@@ -89,11 +95,12 @@ unique_ptr<FunctionData> OraduckBind(ClientContext &context, CopyFunctionBindInp
 	} catch (const oraduck::OraduckError &e) {
 		throw BinderException("OraDuck: " + string(e.what()));
 	}
-	if (result->table.index_count > 0) {
+	if (result->table.index_count > 0 && !result->loader_options.skip_index_maintenance) {
 		throw BinderException("OraDuck: table " + result->table.owner + "." + result->table.table + " has " +
 		                      std::to_string(result->table.index_count) +
 		                      " index(es); parallel direct path loads do not maintain indexes (ORA-26002). "
-		                      "Drop them or load a table without indexes.");
+		                      "Use SKIP_INDEX_MAINTENANCE true to load it and leave its indexes UNUSABLE (rebuild "
+		                      "them afterwards with ALTER INDEX ... REBUILD), or drop the indexes.");
 	}
 	result->plan = oraduck::BuildColumnPlan(names, sql_types, result->table);
 	return std::move(result);
