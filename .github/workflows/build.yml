@@ -42,6 +42,11 @@ jobs:
         with:
           submodules: recursive
 
+      # The workspace belongs to the runner user, not to the container's root: without this, git refuses
+      # the repository and the extension is built without its version (the commit hash)
+      - name: Trust the workspace
+        run: git config --global --add safe.directory '*'
+
       - uses: actions/cache@v4
         with:
           path: /ccache
