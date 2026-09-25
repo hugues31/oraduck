@@ -5,7 +5,8 @@ the OCI Direct Path API — the engine behind `sqlldr direct=true` — in parall
 (one Oracle session per DuckDB thread) and without any intermediate file.
 
 ```sql
-LOAD 'oraduck';
+INSTALL oraduck FROM community;
+LOAD oraduck;
 CREATE SECRET oracle_test (TYPE oraduck, USER 'bench', PASSWORD '...', DSN 'dbhost:1521/ORCLPDB1');
 COPY (SELECT id, amount, operation_date, label FROM source)
 TO 'MY_SCHEMA.MY_TABLE' (FORMAT ORADUCK, CONNECTION 'oracle_test');
@@ -34,7 +35,33 @@ Oracle: put its directory in `LD_LIBRARY_PATH` (Linux) or `PATH` (Windows)
 reports what is missing. On Linux, Instant Client needs `libaio` and `libnsl`;
 on Ubuntu 24.04, install `libaio1t64` and link `libaio.so.1` to `libaio.so.1t64`.
 
-### Online
+### Online (community)
+
+Install the signed extension from the DuckDB community repository. No
+`-unsigned` flag or `allow_unsigned_extensions` setting is needed.
+
+```sql
+INSTALL oraduck FROM community;
+LOAD oraduck;
+```
+
+In Python:
+
+```python
+import duckdb
+
+con = duckdb.connect()
+con.execute("INSTALL oraduck FROM community")
+con.load_extension("oraduck")
+```
+
+To replace a previously installed GitHub Pages or release build, use
+`FORCE INSTALL oraduck FROM community` in a new session before `LOAD oraduck`.
+
+### Alternative: GitHub Pages
+
+The project's own builds are also available from GitHub Pages. These builds
+are unsigned and require the settings shown below.
 
 ```sql
 -- duckdb -unsigned
@@ -43,7 +70,10 @@ INSTALL oraduck FROM 'https://hugues31.github.io/oraduck';
 LOAD oraduck;
 ```
 
-### Offline
+### Offline (GitHub release)
+
+The GitHub release files are unsigned, so the offline examples below also
+enable unsigned extensions.
 
 1. On a connected machine, download:
    - `oraduck-repository.tar.gz` from the [latest release](https://github.com/hugues31/oraduck/releases/latest)
@@ -108,8 +138,8 @@ GEN=ninja make release
 ```
 
 The [Build workflow](.github/workflows/build.yml) builds and tests the three
-platforms on every push; a `v*` tag publishes the extension repository
-(GitHub Pages) and the release.
+platforms for code changes on `main` and in pull requests; a `v*` tag publishes
+the extension repository (GitHub Pages) and the release.
 
 ## Usage
 
