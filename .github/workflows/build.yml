@@ -32,14 +32,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { platform: linux_amd64, runner: ubuntu-24.04, arch: x86_64, instantclient: linux-x64 }
-          - { platform: linux_arm64, runner: ubuntu-24.04-arm, arch: aarch64, instantclient: linux-arm64 }
+          - { platform: linux_amd64, runner: ubuntu-24.04, arch: x86_64, instantclient: linux-x64, triplet: x64-linux-release }
+          - { platform: linux_arm64, runner: ubuntu-24.04-arm, arch: aarch64, instantclient: linux-arm64, triplet: arm64-linux-release }
     env:
       DUCKDB_PLATFORM: ${{ matrix.platform }}
       CCACHE_DIR: /ccache
+      VCPKG_TARGET_TRIPLET: ${{ matrix.triplet }}
     steps:
       - name: Install build and Instant Client dependencies
-        run: yum install -y ninja-build ccache libaio libnsl unzip
+        run: yum install -y ninja-build ccache libaio libnsl curl zip unzip tar
 
       - uses: actions/checkout@v4
         with:
@@ -49,6 +50,16 @@ jobs:
       # the repository and the extension is built without its version (the commit hash)
       - name: Trust the workspace
         run: git config --global --add safe.directory '*'
+
+      # Match community CI for DuckDB v1.5.5, including its root vcpkg manifest requirement
+      - name: Set up the community vcpkg toolchain
+        run: |
+          git init .deps/vcpkg
+          git -C .deps/vcpkg remote add origin https://github.com/microsoft/vcpkg.git
+          git -C .deps/vcpkg fetch --depth 1 origin 84bab45d415d22042bd0b9081aea57f362da3f35
+          git -C .deps/vcpkg checkout --detach FETCH_HEAD
+          .deps/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          echo "VCPKG_TOOLCHAIN_PATH=$PWD/.deps/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
 
       - uses: actions/cache@v4
         with:
