@@ -25,7 +25,7 @@ See [`bench/REPORT.md`](bench/REPORT.md).
 
 ## Install
 
-Prebuilt for **DuckDB v1.5.5** on Linux x86_64 and arm64 (glibc 2.28 or later)
+Prebuilt for **DuckDB v2.0.0** on Linux x86_64 and arm64 (glibc 2.28 or later)
 and Windows x86_64. No compiler is needed.
 
 OraDuck loads [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html)
@@ -80,9 +80,9 @@ enable unsigned extensions.
      (all platforms);
    - the Instant Client 19 Basic zip for the target platform, for example
      `instantclient-basic-linux.x64-19.32.0.0.0dbru.zip`;
-   - for the CLI: `duckdb_cli-linux-amd64.zip` (or `-linux-arm64`,
-     `-windows-amd64`) from the [DuckDB v1.5.5 release](https://github.com/duckdb/duckdb/releases/tag/v1.5.5);
-   - for Python: `pip download duckdb==1.5.5 -d wheels`, on a machine with the
+   - for the CLI: `duckdb-cli-linux-amd64.tar.gz` (or `-linux-arm64`,
+     `-windows-amd64`) from the [DuckDB v2.0.0 release](https://github.com/duckdb/duckdb/releases/tag/v2.0.0);
+   - for Python: `pip download duckdb==2.0.0 -d wheels`, on a machine with the
      same OS, architecture and Python version as the target.
 2. Copy the files to the target machine and extract them (Linux shown; on
    Windows, extract the same archives and add `instantclient_19_32` to `PATH`):
@@ -95,20 +95,20 @@ enable unsigned extensions.
    ```
 
 3. Install the extension from the extracted directory. `INSTALL` copies it into
-   `~/.duckdb/extensions/v1.5.5/<platform>/` once; later sessions only need
+   `~/.duckdb/extensions/v2.0.0/<platform>/` once; later sessions only need
    `LOAD oraduck`.
 
    **CLI**
 
    ```sh
-   unzip duckdb_cli-linux-amd64.zip
+   tar -xzf duckdb-cli-linux-amd64.tar.gz
    ./duckdb -unsigned -c "INSTALL oraduck FROM '/opt/oraduck'; LOAD oraduck; SELECT oraduck_oci_version();"
    ```
 
    **Python**
 
    ```sh
-   pip install --no-index --find-links wheels duckdb==1.5.5
+   pip install --no-index --find-links wheels duckdb==2.0.0
    ```
 
    ```python
@@ -117,7 +117,7 @@ enable unsigned extensions.
    con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
    con.execute("INSTALL oraduck FROM '/opt/oraduck'")
    con.load_extension("oraduck")
-   print(con.sql("SELECT oraduck_oci_version()").fetchone())
+   print(con.execute("SELECT oraduck_oci_version()").fetchone())
    ```
 
 The extracted directory can also be served by an internal web server:
@@ -251,7 +251,8 @@ To reproduce:
 3. `./infra/fakelake/install.sh` builds [Fakelake](https://github.com/soma-smart/Fakelake).
    For the comparison: `INSTALL oracle_scanner FROM community` in the DuckDB CLI,
    and build [duckdb-oracle](https://github.com/rinie/duckdb-oracle) against
-   DuckDB v1.5.5 into `.deps/competitors/rinie/oracle.duckdb_extension`.
+   DuckDB v2.0.0 (the version of `build/release/duckdb`) into
+   `.deps/competitors/rinie/oracle.duckdb_extension`.
 4. Run the campaigns pinned to the client CPUs:
 
    ```sh

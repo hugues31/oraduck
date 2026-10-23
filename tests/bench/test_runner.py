@@ -22,7 +22,7 @@ def test_results_file_starts_with_environment(tmp_path, monkeypatch):
     path = runner.new_results_file(config.OracleConfig.from_env(), "test")
     env = json.loads(path.read_text().splitlines()[0])
     assert env["type"] == "env"
-    assert env["duckdb"].startswith("v1.5.5")
+    assert env["duckdb"].startswith("v2.0.0")
     assert env["oci_client"].startswith("19.32")
     assert env["oracle"].startswith("19.")
 

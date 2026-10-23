@@ -1,6 +1,6 @@
 # Builds the loadable extension for Linux (amd64, arm64) and Windows (amd64), runs the tests that do
 # not need an Oracle database, and on a v* tag publishes:
-#   - a DuckDB extension repository on GitHub Pages: <pages>/v1.5.5/<platform>/oraduck.duckdb_extension.gz
+#   - a DuckDB extension repository on GitHub Pages: <pages>/v2.0.0/<platform>/oraduck.duckdb_extension.gz
 #   - a GitHub release with the extension files
 name: Build
 
@@ -15,9 +15,9 @@ on:
   workflow_dispatch:
 
 env:
-  DUCKDB_VERSION: v1.5.5
+  DUCKDB_VERSION: v2.0.0
   # The submodules are cloned without their tags: the DuckDB version is set explicitly
-  OVERRIDE_GIT_DESCRIBE: v1.5.5
+  OVERRIDE_GIT_DESCRIBE: v2.0.0
   GEN: ninja
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
   EXT_FLAGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
@@ -51,12 +51,12 @@ jobs:
       - name: Trust the workspace
         run: git config --global --add safe.directory '*'
 
-      # Match community CI for DuckDB v1.5.5, including its root vcpkg manifest requirement
+      # Match community CI for DuckDB v2.0.0, including its root vcpkg manifest requirement
       - name: Set up the community vcpkg toolchain
         run: |
           git init .deps/vcpkg
           git -C .deps/vcpkg remote add origin https://github.com/microsoft/vcpkg.git
-          git -C .deps/vcpkg fetch --depth 1 origin 84bab45d415d22042bd0b9081aea57f362da3f35
+          git -C .deps/vcpkg fetch --depth 1 origin cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
           git -C .deps/vcpkg checkout --detach FETCH_HEAD
           .deps/vcpkg/bootstrap-vcpkg.sh -disableMetrics
           echo "VCPKG_TOOLCHAIN_PATH=$PWD/.deps/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
@@ -109,6 +109,11 @@ jobs:
           submodules: recursive
 
       - uses: ilammy/msvc-dev-cmd@v1
+
+      # make test runs DuckDB's test runner (duckdb/scripts/ci/run_tests.py) with python3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - uses: hendrikmuhs/ccache-action@v1.2
         with:

@@ -103,8 +103,8 @@ DataChunk fills it exactly, without copying strings. The probe (section 11)
 measured 8,192 rows 12 % faster on a 5-column table; a `COLUMN_ARRAY_ROWS`
 option is left for a later version.
 
-The number of Oracle sessions equals the number of DuckDB threads that receive
-data (`SET threads = N`).
+The number of Oracle sessions is at most the number of DuckDB threads
+(`SET threads = N`): the most that send rows at the same time.
 
 DuckDB's generic file options (`PER_THREAD_OUTPUT`, `PARTITION_BY`,
 `FILE_SIZE_BYTES`, `USE_TMP_FILE`) are rejected with `FORMAT ORADUCK`. If a
@@ -126,7 +126,7 @@ is rejected: DuckDB would otherwise replace it with a temporary file.
 | `ColumnPlan`        | For each query column: the matching Oracle column, the chosen OCI external type, the encoder. Built at bind time, immutable afterwards. |
 | Encoders            | Convert a DuckDB vector into OCI column array entries (see 4.3). Pure functions, testable without Oracle. |
 | `DirectPathLoader`  | Direct path context of one session: prepare, column array, stream, `ColArrayToStream` / `LoadStream` loop, finish, abort. RAII. |
-| Copy function       | DuckDB copy function callbacks (bind, global init, local init, sink, combine, finalize). |
+| Copy function       | DuckDB copy function callbacks (bind, global init, prepare batch, flush batch, finalize). |
 | `OracleError`       | Wraps `OCIErrorGet` output: ORA code and text, plus the column and row when available. |
 
 ### 4.2 How a COPY runs
@@ -142,11 +142,13 @@ is rejected: DuckDB would otherwise replace it with a temporary file.
    - error if the table has an index (6.4) or a `NOT NULL` column that the
      query does not provide;
    - schema errors are raised here, before any data is sent.
-2. **Global init**: shared state (loaders waiting for commit, mutex).
-3. **Local init** (per thread): empty local state. The session and the direct
-   path context are opened **lazily** on the thread's first `sink`, so small
-   tables do not open useless sessions.
-4. **Sink** (per thread, per DataChunk of at most 2,048 rows)
+2. **Global init**: shared state (the sessions, those idle, mutex).
+3. **Prepare batch** (several threads at once). DuckDB 2 buffers the rows of
+   each thread into batches, here one DataChunk of at most 2,048 rows, and
+   hands every batch to `prepare_batch`, which:
+   - takes an idle session, or opens one (session and direct path context)
+     when all are busy: there are at most as many sessions as threads sending
+     rows at the same time, and small tables do not open useless sessions;
    - fills the OCI column array from the vectors (encoders);
    - calls `OCIDirPathColArrayToStream`; when the stream is full
      (`OCI_CONTINUE`), calls `OCIDirPathLoadStream`, resets the stream and
@@ -155,12 +157,14 @@ is rejected: DuckDB would otherwise replace it with a temporary file.
    - `OCI_NEED_DATA` from `OCIDirPathLoadStream` means the stream ended with a
      partial row (a row wider than the buffer); its remainder goes into the
      next stream;
-   - the stream copies the data: the DataChunk can be released when the sink
-     returns.
-5. **Combine** (per thread): sends the pending stream, then hands the loader
-   over to the global state **without committing**.
-6. **Finalize** (single thread): calls `OCIDirPathFinish` on every loader, in
-   parallel threads (each commits its session), then closes the sessions.
+   - the stream copies the data: the batch can be released when the call
+     returns;
+   - gives the session back, **without committing**.
+4. **Flush batch**: nothing to do. DuckDB serializes the `flush_batch` calls of
+   a file, which is why the rows are sent in `prepare_batch`.
+5. **Finalize** (single thread): calls `OCIDirPathFinish` on every session, in
+   parallel threads (each sends its pending stream and commits), then closes
+   the sessions.
 
 The copy function declares the parallel execution mode
 (`PARALLEL_COPY_TO_FILE`): row order is not preserved, which does not matter
@@ -184,13 +188,13 @@ format, and never copy strings.
 | NULL | `OCI_DIRPATH_COL_NULL` flag from the validity mask |
 
 Encoding buffers (NUMBER ≤ 22 bytes, DATE 7, TIMESTAMP 11) are allocated once
-per thread and reused. Several column arrays are converted into the same stream
+per session and reused. Several column arrays are converted into the same stream
 before it is sent (probe: 16 % faster). Table, schema and column names are
 passed to OCI double-quoted, otherwise OCI upper-cases them (ORA-39826).
 
-Zero-copy pointers target the DuckDB vector memory, including short strings
-(≤ 12 bytes) stored inside the `string_t` itself: they stay valid until the
-conversion into the stream, which happens within the same sink.
+Zero-copy pointers target the memory of the batch's vectors, including short
+strings (≤ 12 bytes) stored inside the `string_t` itself: they stay valid until
+the conversion into the stream, which happens within the same `prepare_batch`.
 
 ## 5. Type mapping
 
@@ -251,7 +255,7 @@ not offered: it gives up the parallel sessions, and a unique index still ends
 ## 7. Build and dependencies
 
 - Based on the official `duckdb/extension-template` (CMake); DuckDB is a
-  submodule pinned to v1.5.5. DuckDB forces C++11 through the CMake cache; the
+  submodule pinned to v2.0.0. DuckDB forces C++11 through the CMake cache; the
   extension targets are set to C++17.
 - The benchmark harness and the end-to-end tests drive the **DuckDB CLI built
   with the extension** (`build/release/duckdb`). The Python `duckdb` package is
@@ -271,7 +275,7 @@ not offered: it gives up the parallel sessions, and a unique index still ends
   without Instant Client (as DuckDB's community CI does), then with it; none
   needs an Oracle database. A `v*` tag publishes a DuckDB
   extension repository on GitHub Pages
-  (`v1.5.5/<platform>/oraduck.duckdb_extension.gz`) and a release holding the
+  (`v2.0.0/<platform>/oraduck.duckdb_extension.gz`) and a release holding the
   same tree as `oraduck-repository.tar.gz`, for offline installs.
 
 ## 8. Benchmark infrastructure

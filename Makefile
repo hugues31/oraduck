@@ -4,6 +4,9 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXT_NAME=oraduck
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
+# DuckDB 2 no longer reads its version from git: take it from the submodule's tag (the CI sets it explicitly)
+OVERRIDE_GIT_DESCRIBE ?= $(shell git -C $(PROJ_DIR)duckdb describe --tags --exact-match 2>/dev/null)
+
 # Shared DuckDB extension Makefile (release, debug, test, ...)
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 

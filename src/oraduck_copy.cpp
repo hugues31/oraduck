@@ -1,7 +1,7 @@
 #include "oraduck_copy.hpp"
 
 #include "duckdb/common/file_system.hpp"
-#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -41,16 +41,20 @@ struct OraduckBindData : public FunctionData {
 	}
 };
 
-struct OraduckGlobalState : public GlobalFunctionData {
-	std::mutex lock;
-	// Sessions whose data has been sent, committed together in Finalize
-	std::vector<std::unique_ptr<oraduck::DirectPathLoader>> loaders;
-};
-
-struct OraduckLocalState : public LocalFunctionData {
-	std::unique_ptr<oraduck::DirectPathLoader> loader; // opened on the first Sink
+// One Oracle session and its work buffers, used by one thread at a time
+struct OraduckWriter {
+	std::unique_ptr<oraduck::DirectPathLoader> loader;
 	std::vector<std::vector<uint8_t>> scratch;
 	std::vector<UnifiedVectorFormat> formats;
+};
+
+// DuckDB hands the rows over in batches, from several threads at once: each batch borrows an idle session, so
+// there are at most as many sessions as threads loading at the same time
+struct OraduckGlobalState : public GlobalFunctionData {
+	std::mutex lock;
+	// Every session of the load, committed together in Finalize
+	std::vector<std::unique_ptr<OraduckWriter>> writers;
+	std::vector<OraduckWriter *> idle;
 };
 
 void OraduckCopyOptions(ClientContext &, CopyOptionsInput &input) {
@@ -60,12 +64,12 @@ void OraduckCopyOptions(ClientContext &, CopyOptionsInput &input) {
 }
 
 unique_ptr<FunctionData> OraduckBind(ClientContext &context, CopyFunctionBindInput &input,
-                                      const vector<string> &names, const vector<LogicalType> &sql_types) {
+                                      const vector<Identifier> &names, const vector<LogicalType> &sql_types) {
 	auto &info = input.info;
 	auto result = make_uniq<OraduckBindData>();
 	string secret_name;
 	for (auto &option : info.options) {
-		const auto key = StringUtil::Lower(option.first);
+		const auto &key = option.first; // Identifier: compared case-insensitively
 		if (key == "connection") {
 			secret_name = option.second[0].ToString();
 		} else if (key == "stream_size") {
@@ -102,7 +106,13 @@ unique_ptr<FunctionData> OraduckBind(ClientContext &context, CopyFunctionBindInp
 		                      "Use SKIP_INDEX_MAINTENANCE true to load it and leave its indexes UNUSABLE (rebuild "
 		                      "them afterwards with ALTER INDEX ... REBUILD), or drop the indexes.");
 	}
-	result->plan = oraduck::BuildColumnPlan(names, sql_types, result->table);
+	// Column names as written in the query: the plan matches them exactly first, then case-insensitively
+	std::vector<std::string> column_names;
+	column_names.reserve(names.size());
+	for (const auto &name : names) {
+		column_names.push_back(name.GetIdentifierName());
+	}
+	result->plan = oraduck::BuildColumnPlan(column_names, sql_types, result->table);
 	return std::move(result);
 }
 
@@ -110,89 +120,101 @@ unique_ptr<GlobalFunctionData> OraduckInitGlobal(ClientContext &, FunctionData &
 	return make_uniq<OraduckGlobalState>();
 }
 
-unique_ptr<LocalFunctionData> OraduckInitLocal(ExecutionContext &, FunctionData &) {
-	return make_uniq<OraduckLocalState>();
-}
-
 void OraduckInitializeOperator(GlobalFunctionData &, const PhysicalOperator &op) {
 	auto &copy = op.Cast<PhysicalCopyToFile>();
-	if (copy.per_thread_output || copy.partition_output || copy.rotate || copy.file_size_bytes.IsValid() ||
-	    copy.use_tmp_file) {
+	if (copy.per_thread_output || copy.partition_output || copy.batches_per_file.IsValid() ||
+	    copy.file_size_bytes.IsValid() || copy.use_tmp_file) {
 		throw NotImplementedException("OraDuck: file options (PER_THREAD_OUTPUT, PARTITION_BY, "
 		                              "FILE_SIZE_BYTES, USE_TMP_FILE) do not apply to FORMAT ORADUCK");
 	}
 }
 
-void OpenLoader(const OraduckBindData &bind, OraduckLocalState &state) {
+std::unique_ptr<OraduckWriter> OpenWriter(const OraduckBindData &bind) {
 	std::vector<oraduck::DirPathColumnSpec> specs;
 	specs.reserve(bind.plan.size());
 	for (const auto &column : bind.plan) {
 		specs.push_back(column.spec);
 	}
-	state.loader = std::make_unique<oraduck::DirectPathLoader>(bind.credentials, bind.table.owner, bind.table.table,
-	                                                            specs, bind.loader_options);
-	state.scratch.resize(bind.plan.size());
+	auto writer = std::make_unique<OraduckWriter>();
+	writer->loader = std::make_unique<oraduck::DirectPathLoader>(bind.credentials, bind.table.owner, bind.table.table,
+	                                                              specs, bind.loader_options);
+	writer->scratch.resize(bind.plan.size());
 	for (idx_t i = 0; i < bind.plan.size(); i++) {
-		state.scratch[i].resize(size_t(state.loader->Rows()) * bind.plan[i].scratch_width);
+		writer->scratch[i].resize(size_t(writer->loader->Rows()) * bind.plan[i].scratch_width);
 	}
-	state.formats.resize(bind.plan.size());
+	writer->formats.resize(bind.plan.size());
+	return writer;
 }
 
-void OraduckSink(ExecutionContext &, FunctionData &bind_p, GlobalFunctionData &, LocalFunctionData &lstate_p,
-                  DataChunk &input) {
-	auto &bind = bind_p.Cast<OraduckBindData>();
-	auto &state = lstate_p.Cast<OraduckLocalState>();
-	const idx_t count = input.size();
-	if (count == 0) {
-		return;
-	}
-	try {
-		if (!state.loader) {
-			OpenLoader(bind, state);
+OraduckWriter &AcquireWriter(const OraduckBindData &bind, OraduckGlobalState &gstate) {
+	{
+		std::lock_guard<std::mutex> guard(gstate.lock);
+		if (!gstate.idle.empty()) {
+			auto writer = gstate.idle.back();
+			gstate.idle.pop_back();
+			return *writer;
 		}
-		auto &loader = *state.loader;
-		for (idx_t i = 0; i < bind.plan.size(); i++) {
-			input.data[bind.plan[i].source_index].ToUnifiedFormat(count, state.formats[i]);
-		}
-		const idx_t capacity = loader.Rows();
-		for (idx_t offset = 0; offset < count; offset += capacity) {
-			const idx_t n = MinValue<idx_t>(capacity, count - offset);
-			for (idx_t i = 0; i < bind.plan.size(); i++) {
-				oraduck::WriteColumn(bind.plan[i], static_cast<oraduck::ub2>(i), state.formats[i], offset, n,
-				                      state.scratch[i].data(), loader);
-			}
-			loader.ConvertAndLoad(static_cast<oraduck::ub4>(n));
-		}
-	} catch (const oraduck::OraduckError &e) {
-		throw IOException("OraDuck: " + string(e.what()));
 	}
-}
-
-void OraduckCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &gstate_p, LocalFunctionData &lstate_p) {
-	auto &gstate = gstate_p.Cast<OraduckGlobalState>();
-	auto &state = lstate_p.Cast<OraduckLocalState>();
-	if (!state.loader) {
-		return;
-	}
-	try {
-		state.loader->Flush();
-	} catch (const oraduck::OraduckError &e) {
-		throw IOException("OraDuck: " + string(e.what()));
-	}
+	auto writer = OpenWriter(bind); // logs in: outside the lock
 	std::lock_guard<std::mutex> guard(gstate.lock);
-	gstate.loaders.push_back(std::move(state.loader));
+	gstate.writers.push_back(std::move(writer));
+	return *gstate.writers.back();
+}
+
+void ReleaseWriter(OraduckGlobalState &gstate, OraduckWriter &writer) {
+	std::lock_guard<std::mutex> guard(gstate.lock);
+	gstate.idle.push_back(&writer);
+}
+
+void WriteChunk(const OraduckBindData &bind, OraduckWriter &writer, DataChunk &input) {
+	const idx_t count = input.size();
+	auto &loader = *writer.loader;
+	for (idx_t i = 0; i < bind.plan.size(); i++) {
+		input.data[bind.plan[i].source_index].ToUnifiedFormat(writer.formats[i]);
+	}
+	const idx_t capacity = loader.Rows();
+	for (idx_t offset = 0; offset < count; offset += capacity) {
+		const idx_t n = MinValue<idx_t>(capacity, count - offset);
+		for (idx_t i = 0; i < bind.plan.size(); i++) {
+			oraduck::WriteColumn(bind.plan[i], static_cast<oraduck::ub2>(i), writer.formats[i], offset, n,
+			                      writer.scratch[i].data(), loader);
+		}
+		loader.ConvertAndLoad(static_cast<oraduck::ub4>(n));
+	}
+}
+
+// Sends the batch to Oracle; runs on several threads at once (the flush that follows is serialized by DuckDB)
+unique_ptr<PreparedBatchData> OraduckPrepareBatch(ClientContext &, FunctionData &bind_p, GlobalFunctionData &gstate_p,
+                                                  unique_ptr<ColumnDataCollection> collection) {
+	auto &bind = bind_p.Cast<OraduckBindData>();
+	auto &gstate = gstate_p.Cast<OraduckGlobalState>();
+	try {
+		// On error the writer is not released: the query fails and its session is aborted
+		auto &writer = AcquireWriter(bind, gstate);
+		for (auto &chunk : collection->Chunks()) {
+			WriteChunk(bind, writer, chunk);
+		}
+		ReleaseWriter(gstate, writer);
+	} catch (const oraduck::OraduckError &e) {
+		throw IOException("OraDuck: " + string(e.what()));
+	}
+	return make_uniq<PreparedBatchData>();
+}
+
+void OraduckFlushBatch(ClientContext &, FunctionData &, GlobalFunctionData &, PreparedBatchData &) {
+	// the rows were sent by OraduckPrepareBatch
 }
 
 void OraduckFinalize(ClientContext &, FunctionData &, GlobalFunctionData &gstate_p) {
 	auto &gstate = gstate_p.Cast<OraduckGlobalState>();
-	auto &loaders = gstate.loaders;
-	std::vector<std::string> errors(loaders.size());
+	auto &writers = gstate.writers;
+	std::vector<std::string> errors(writers.size());
 	std::vector<std::thread> threads;
-	threads.reserve(loaders.size());
-	for (size_t i = 0; i < loaders.size(); i++) {
-		threads.emplace_back([&loaders, &errors, i]() {
+	threads.reserve(writers.size());
+	for (size_t i = 0; i < writers.size(); i++) {
+		threads.emplace_back([&writers, &errors, i]() {
 			try {
-				loaders[i]->Finish();
+				writers[i]->loader->Finish();
 			} catch (const std::exception &e) {
 				errors[i] = e.what();
 			}
@@ -209,7 +231,8 @@ void OraduckFinalize(ClientContext &, FunctionData &, GlobalFunctionData &gstate
 		}
 	}
 	const idx_t sessions = errors.size();
-	loaders.clear(); // aborts the failed sessions
+	gstate.idle.clear();
+	writers.clear(); // aborts the failed sessions
 	if (failed == 0) {
 		return;
 	}
@@ -231,10 +254,9 @@ void RegisterOraduckCopy(ExtensionLoader &loader) {
 	function.copy_options = OraduckCopyOptions;
 	function.copy_to_bind = OraduckBind;
 	function.copy_to_initialize_global = OraduckInitGlobal;
-	function.copy_to_initialize_local = OraduckInitLocal;
 	function.initialize_operator = OraduckInitializeOperator;
-	function.copy_to_sink = OraduckSink;
-	function.copy_to_combine = OraduckCombine;
+	function.prepare_batch = OraduckPrepareBatch;
+	function.flush_batch = OraduckFlushBatch;
 	function.copy_to_finalize = OraduckFinalize;
 	function.execution_mode = OraduckExecutionMode;
 	loader.RegisterFunction(function);

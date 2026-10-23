@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Lays out the CI artifacts as a DuckDB extension repository and as release files.
-#   usage: DUCKDB_VERSION=v1.5.5 package.sh DIST SITE RELEASE
+#   usage: DUCKDB_VERSION=v2.0.0 package.sh DIST SITE RELEASE
 #   DIST/oraduck-<platform>/oraduck.duckdb_extension          (actions/download-artifact layout)
 #   -> SITE/<version>/<platform>/oraduck.duckdb_extension.gz  (read by INSTALL oraduck FROM '<SITE url or path>')
 #   -> RELEASE/oraduck-repository.tar.gz                       (the same tree, for offline installs; DuckDB takes
