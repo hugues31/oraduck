@@ -20,11 +20,12 @@ namespace {
 constexpr int64_t kRows = 300000;
 constexpr uint32_t kSessions = 4;
 
-// Drops the listed views and tables when the test ends, even when it fails
+// Drops the listed views, tables and types when the test ends, even when it fails
 struct DropGuard {
 	OciSession &session;
 	std::vector<std::string> tables;
 	std::vector<std::string> views = {};
+	std::vector<std::string> types = {};
 
 	void DropAll() {
 		for (const auto &view : views) {
@@ -33,6 +34,10 @@ struct DropGuard {
 		}
 		for (const auto &table : tables) {
 			DropTableIfExists(session, table);
+		}
+		for (const auto &type : types) {
+			session.Execute("BEGIN EXECUTE IMMEDIATE 'DROP TYPE " + type +
+			                " FORCE'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -4043 THEN RAISE; END IF; END;");
 		}
 	}
 	~DropGuard() {
@@ -178,15 +183,13 @@ size_t LeftoverTasks(OciSession &session) {
 	    Scalar(session, "SELECT COUNT(*) FROM user_parallel_execute_tasks WHERE task_name LIKE 'ORADUCK%'"));
 }
 
-// TIMESTAMP_TO_SCN lags a few seconds: wait until a snapshot taken now sees the loaded rows (before that, the
-// SCN precedes the CREATE TABLE, ORA-01466, or the INSERT, no rows)
-void WaitForSnapshot(OciSession &session, const std::string &table, int64_t rows) {
+// AS OF SCN on a table changed by DDL a few seconds ago raises ORA-01466, even at the current SCN: wait for it
+void WaitForFlashback(OciSession &session, const std::string &table) {
 	for (int attempt = 0; attempt < 60; attempt++) {
 		try {
-			if (Scalar(session, "SELECT TO_CHAR(COUNT(*)) FROM " + table +
-			                        " AS OF SCN TIMESTAMP_TO_SCN(SYSTIMESTAMP)") == std::to_string(rows)) {
-				return;
-			}
+			session.QueryStrings("SELECT 1 FROM " + table +
+			                     " AS OF SCN DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER WHERE ROWNUM < 1");
+			return;
 		} catch (const OracleError &e) {
 			if (e.ora_code != 1466) {
 				throw;
@@ -194,7 +197,7 @@ void WaitForSnapshot(OciSession &session, const std::string &table, int64_t rows
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(250));
 	}
-	FAIL("a snapshot of " << table << " still misses rows after 15 s");
+	FAIL("flashback query on " << table << " still raises ORA-01466 after 15 s");
 }
 
 // Message of the OracleError that fn throws, "" when it throws none
@@ -314,9 +317,13 @@ void CheckPartitionedTable(const std::string &table, const std::string &tablespa
 
 	// Snapshot
 	{
+		// The current SCN comes from DBMS_FLASHBACK (granted to the test user), never from TIMESTAMP_TO_SCN, which lags
 		const std::string scn = ReadCurrentScn(session);
-		CHECK(AllDigits(scn));
-		WaitForSnapshot(session, table, kRows);
+		REQUIRE(AllDigits(scn));
+		CHECK(std::stoll(scn) <=
+		      std::stoll(Scalar(session, "SELECT TO_CHAR(DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER) FROM dual")));
+		CHECK(ReadCurrentScn(reader).empty());
+		WaitForFlashback(session, table);
 
 		const auto plan = TimedPlan(session, source, SplitStrategy::kAuto, SnapshotMode::kAuto, kSessions, "bench");
 		CHECK(AllDigits(plan.scn));
@@ -325,16 +332,16 @@ void CheckPartitionedTable(const std::string &table, const std::string &tablespa
 		const auto forced = TimedPlan(session, source, SplitStrategy::kAuto, SnapshotMode::kScn, kSessions, "bench");
 		CHECK(AllDigits(forced.scn));
 
-		// Flashback query on another user's table needs the FLASHBACK privilege
+		// The reader can read neither DBMS_FLASHBACK nor V$DATABASE: per-session reads under auto, an error under scn
 		const auto reader_source = DescribeSource(reader, ParseTargetName(owner + "." + table));
 		const auto fallback =
 		    TimedPlan(reader, reader_source, SplitStrategy::kAuto, SnapshotMode::kAuto, kSessions, "reader");
 		CHECK(fallback.scn.empty());
-		CHECK_THAT(fallback.notes, Catch::Contains("snapshot") && Catch::Contains("ORA-01031"));
+		CHECK_THAT(fallback.notes, Catch::Contains("snapshot: per session (no current SCN: needs EXECUTE ON "
+		                                           "DBMS_FLASHBACK or SELECT ON V_$DATABASE)"));
 		CheckEveryRowOnce(reader, reader_source, fallback, kRows, sum);
-		CHECK_THAT(OracleErrorText(
-		               [&] { PlanWork(reader, reader_source, SplitStrategy::kAuto, SnapshotMode::kScn, kSessions); }),
-		           Catch::StartsWith("snapshot 'scn'") && Catch::Contains("ORA-01031"));
+		CHECK_THROWS_WITH(PlanWork(reader, reader_source, SplitStrategy::kAuto, SnapshotMode::kScn, kSessions),
+		                  Catch::StartsWith("snapshot 'scn'") && Catch::Contains("EXECUTE ON DBMS_FLASHBACK"));
 		CHECK(LeftoverTasks(reader) == 0);
 	}
 }
@@ -423,7 +430,57 @@ TEST_CASE("Work planning: index-organized table", "[oracle][work_units]") {
 	                  Catch::StartsWith("split 'extents'") && Catch::Contains("index-organized"));
 }
 
-TEST_CASE("Work planning: no extent source", "[oracle][work_units]") {
+TEST_CASE("Work planning: object tables", "[oracle][work_units]") {
+	OciSession session(TestCredentials());
+	OciSession reader(ReaderCredentials());
+	DropGuard guard {session, {"ITEST_WU_OBJ", "ITEST_WU_OBJIOT"}, {}, {"ITEST_WU_TYPE"}};
+	guard.DropAll();
+	session.Execute("CREATE TYPE ITEST_WU_TYPE AS OBJECT (ID NUMBER(10), V VARCHAR2(10))");
+	session.Execute("CREATE TABLE ITEST_WU_OBJ OF ITEST_WU_TYPE");
+	session.Execute("CREATE TABLE ITEST_WU_OBJIOT OF ITEST_WU_TYPE (PRIMARY KEY (ID)) ORGANIZATION INDEX");
+	for (const std::string table : {"ITEST_WU_OBJ", "ITEST_WU_OBJIOT"}) {
+		session.Execute("INSERT INTO " + table +
+		                " SELECT ITEST_WU_TYPE(LEVEL, 'v' || LEVEL) FROM dual CONNECT BY LEVEL <= 1000");
+		session.Execute("GRANT SELECT ON " + table + " TO " + ReaderCredentials().user);
+	}
+	const std::string owner = Scalar(session, "SELECT USER FROM dual");
+	// ALL_TABLES does not list object tables (ALL_ALL_TABLES does)
+	REQUIRE(Scalar(session, "SELECT COUNT(*) FROM all_tables WHERE owner = USER AND table_name LIKE 'ITEST_WU_OBJ%'") ==
+	        "0");
+
+	// A heap object table: extents from DBA_EXTENTS
+	const auto heap = DescribeSource(session, ParseTargetName("ITEST_WU_OBJ"));
+	const auto extents = TimedPlan(session, heap, SplitStrategy::kAuto, SnapshotMode::kNone, kSessions, "bench");
+	CHECK(extents.strategy == SplitStrategy::kExtents);
+	CHECK_THAT(extents.notes, Catch::Contains("DBA_EXTENTS"));
+	CheckEveryRowOnce(session, heap, extents, 1000, "500500");
+
+	// An object IOT has no TABLE segment: hash
+	const auto iot = DescribeSource(session, ParseTargetName("ITEST_WU_OBJIOT"));
+	const auto hash = TimedPlan(session, iot, SplitStrategy::kAuto, SnapshotMode::kNone, kSessions, "bench");
+	CHECK(hash.strategy == SplitStrategy::kHash);
+	CHECK_THAT(hash.notes, Catch::Contains("index-organized"));
+	CheckEveryRowOnce(session, iot, hash, 1000, "500500");
+	CHECK_THROWS_WITH(PlanWork(session, iot, SplitStrategy::kExtents, SnapshotMode::kNone, kSessions),
+	                  Catch::StartsWith("split 'extents'") && Catch::Contains("index-organized"));
+
+	// The reader: no DBA_EXTENTS (ORA-00942), and DBMS_PARALLEL_EXECUTE refuses object tables (ORA-29491) once its
+	// task is created
+	const auto reader_heap = DescribeSource(reader, ParseTargetName(owner + ".ITEST_WU_OBJ"));
+	CHECK_THROWS_WITH(PlanWork(reader, reader_heap, SplitStrategy::kExtents, SnapshotMode::kNone, kSessions),
+	                  Catch::StartsWith("split 'extents' needs DBA_EXTENTS or DBMS_PARALLEL_EXECUTE: ") &&
+	                      Catch::Contains("ORA-00942") && Catch::Contains("ORA-29491"));
+	// The task created before the failure is dropped
+	CHECK(LeftoverTasks(reader) == 0);
+	const auto fallback =
+	    TimedPlan(reader, reader_heap, SplitStrategy::kAuto, SnapshotMode::kNone, kSessions, "reader");
+	CHECK(fallback.strategy == SplitStrategy::kHash);
+	CHECK_THAT(fallback.notes, Catch::Contains("ORA-29491") && Catch::Contains("using hash"));
+	CheckEveryRowOnce(reader, reader_heap, fallback, 1000, "500500");
+	CHECK(LeftoverTasks(reader) == 0);
+}
+
+TEST_CASE("Work planning: table not listed in ALL_ALL_TABLES", "[oracle][work_units]") {
 	OciSession session(TestCredentials());
 	OciSession reader(ReaderCredentials());
 	DropGuard guard {session, {"ITEST_WU_PRIVATE"}};
@@ -431,22 +488,32 @@ TEST_CASE("Work planning: no extent source", "[oracle][work_units]") {
 	session.Execute("CREATE TABLE ITEST_WU_PRIVATE (ID NUMBER(10))");
 	session.Execute("INSERT INTO ITEST_WU_PRIVATE VALUES (1)");
 
-	// The reader has no privilege on the table: DBA_EXTENTS (ORA-00942) and DBMS_PARALLEL_EXECUTE both fail
+	// The reader has no privilege on the table: nothing proves it is a heap table, so no extents
 	OracleTableDescription source;
 	source.owner = Scalar(session, "SELECT USER FROM dual");
 	source.name = "ITEST_WU_PRIVATE";
 	source.kind = SourceKind::kTable;
 	CHECK_THROWS_WITH(PlanWork(reader, source, SplitStrategy::kExtents, SnapshotMode::kNone, kSessions),
-	                  Catch::StartsWith("split 'extents' needs DBA_EXTENTS or DBMS_PARALLEL_EXECUTE: ") &&
-	                      Catch::Contains("ORA-00942"));
-	// The task created before the failure is dropped
-	CHECK(LeftoverTasks(reader) == 0);
-
+	                  Catch::StartsWith("split 'extents' needs a heap table: ") && Catch::Contains("ALL_ALL_TABLES"));
 	const auto plan = TimedPlan(reader, source, SplitStrategy::kAuto, SnapshotMode::kNone, kSessions, "reader");
 	CHECK(plan.strategy == SplitStrategy::kNone);
 	CHECK(plan.slices.size() == 1);
-	CHECK_THAT(plan.notes, Catch::Contains("extents") && Catch::Contains("hash"));
+	CHECK_THAT(plan.notes, Catch::Contains("ALL_ALL_TABLES") && Catch::Contains("hash: ORA-00942"));
 	CHECK(LeftoverTasks(reader) == 0);
+}
+
+TEST_CASE("Work planning: snapshot refused by Oracle", "[oracle][work_units]") {
+	OciSession session(TestCredentials());
+	// The test user reads V_$SESSION, but not AS OF SCN
+	OracleTableDescription source;
+	source.owner = "SYS";
+	source.name = "V_$SESSION";
+	source.kind = SourceKind::kView;
+	const auto plan = TimedPlan(session, source, SplitStrategy::kNone, SnapshotMode::kAuto, kSessions, "bench");
+	CHECK(plan.scn.empty());
+	CHECK_THAT(plan.notes, Catch::StartsWith("snapshot: per session (AS OF SCN: ORA-"));
+	CHECK_THAT(OracleErrorText([&] { PlanWork(session, source, SplitStrategy::kNone, SnapshotMode::kScn, kSessions); }),
+	           Catch::StartsWith("snapshot 'scn' cannot read SYS.V_$SESSION AS OF SCN ") && Catch::Contains("ORA-"));
 }
 
 TEST_CASE("Work planning: one session", "[oracle][work_units]") {

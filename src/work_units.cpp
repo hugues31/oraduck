@@ -18,10 +18,11 @@ namespace oraduck {
 
 namespace {
 
+// TIMESTAMP_TO_SCN(SYSTIMESTAMP) is not a source: it lags a few seconds, so a snapshot would miss recent commits
 const char *const kScnSources[][2] = {
     {"DBMS_FLASHBACK", "SELECT TO_CHAR(DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER) FROM dual"},
-    {"V$DATABASE", "SELECT TO_CHAR(current_scn) FROM v$database"},
-    {"TIMESTAMP_TO_SCN", "SELECT TO_CHAR(TIMESTAMP_TO_SCN(SYSTIMESTAMP)) FROM dual"}};
+    {"V$DATABASE", "SELECT TO_CHAR(current_scn) FROM v$database"}};
+const char *const kScnGrants = "needs EXECUTE ON DBMS_FLASHBACK or SELECT ON V_$DATABASE";
 
 constexpr int32_t kTableNotFound = 942;
 constexpr int32_t kInsufficientPrivileges = 1031;
@@ -74,7 +75,7 @@ std::string ObjectSql(const OracleTableDescription &source) {
 	return QuoteIdentifier(source.owner) + "." + QuoteIdentifier(source.name);
 }
 
-std::string ReadScn(OciSession &session, std::string &failures, int32_t &ora_code) {
+std::string ReadScn(OciSession &session, std::string &failures) {
 	for (const auto &source : kScnSources) {
 		try {
 			const auto rows = session.QueryStrings(source[1]);
@@ -84,7 +85,6 @@ std::string ReadScn(OciSession &session, std::string &failures, int32_t &ora_cod
 			failures += (failures.empty() ? "" : ", ") + std::string(source[0]) + ": no value";
 		} catch (const OracleError &e) {
 			failures += (failures.empty() ? "" : ", ") + std::string(source[0]) + ": " + OracleCode(e);
-			ora_code = e.ora_code;
 		}
 	}
 	return "";
@@ -95,17 +95,17 @@ void PlanSnapshot(OciSession &session, const OracleTableDescription &source, Sna
 		return;
 	}
 	std::string failures;
-	int32_t ora_code = 0;
-	const std::string scn = ReadScn(session, failures, ora_code);
+	const std::string scn = ReadScn(session, failures);
 	if (scn.empty()) {
 		if (mode == SnapshotMode::kScn) {
-			throw OracleError("snapshot 'scn' cannot read the current SCN (" + failures + ")", ora_code);
+			throw OraduckError("snapshot 'scn' cannot read the current SCN: " + std::string(kScnGrants) + " (" +
+			                   failures + ")");
 		}
-		AddNote(plan, "snapshot: no SCN (" + failures + "), reading without AS OF SCN");
+		AddNote(plan, "snapshot: per session (no current SCN: " + std::string(kScnGrants) + ")");
 		return;
 	}
-	// Flashback query on another user's table needs the FLASHBACK privilege; a table changed by DDL after the SCN
-	// raises ORA-01466
+	// Flashback query on another user's table needs the FLASHBACK privilege; a table changed by DDL in the last few
+	// seconds raises ORA-01466, even at the current SCN
 	try {
 		session.QueryStrings("SELECT 1 FROM " + ObjectSql(source) + " AS OF SCN TO_NUMBER(:b1) WHERE ROWNUM < 1",
 		                     {scn});
@@ -115,7 +115,7 @@ void PlanSnapshot(OciSession &session, const OracleTableDescription &source, Sna
 			                      OracleMessage(e),
 			                  e.ora_code);
 		}
-		AddNote(plan, "snapshot: " + OracleMessage(e) + ", reading without AS OF SCN");
+		AddNote(plan, "snapshot: per session (AS OF SCN: " + OracleMessage(e) + ")");
 		return;
 	}
 	plan.scn = scn;
@@ -126,13 +126,14 @@ void PlanSingle(WorkPlan &plan) {
 	plan.slices.assign(1, Slice());
 }
 
-// Why the table's rows have no ROWID ranges ("" for a heap table, or when ALL_TABLES does not show it)
+// Why the table cannot be read by ROWID ranges, "" for a heap table. ALL_ALL_TABLES, unlike ALL_TABLES, lists object
+// tables; a table it does not show is not known to be a heap table.
 std::string NonHeapReason(OciSession &session, const OracleTableDescription &source) {
 	const auto rows = session.QueryStrings(
-	    "SELECT iot_type, cluster_name, external, hybrid FROM all_tables WHERE owner = :1 AND table_name = :2",
+	    "SELECT iot_type, cluster_name, external, hybrid FROM all_all_tables WHERE owner = :1 AND table_name = :2",
 	    {source.owner, source.name});
 	if (rows.empty()) {
-		return "";
+		return "not in ALL_ALL_TABLES";
 	}
 	const auto &row = rows[0];
 	if (!row[0].empty()) {
@@ -150,16 +151,19 @@ std::string NonHeapReason(OciSession &session, const OracleTableDescription &sou
 	return "";
 }
 
-// ROWID ranges from DBA_EXTENTS, sized from the largest data object. DBA_EXTENTS and ALL_OBJECTS are joined here:
+// ROWID ranges from DBA_EXTENTS, sized from the largest data object; false when an extent's segment has no data
+// object in ALL_OBJECTS (partitions changed between the two queries). DBA_EXTENTS and ALL_OBJECTS are joined here:
 // joined in Oracle they took 3.5 s for a table of 300 partitions, against 40 ms for the two queries.
-std::vector<Slice> SlicesFromDbaExtents(OciSession &session, const OracleTableDescription &source, uint32_t sessions) {
+bool SlicesFromDbaExtents(OciSession &session, const OracleTableDescription &source, uint32_t sessions,
+                          std::vector<Slice> &slices) {
 	const auto extent_rows = session.QueryStrings(
 	    "SELECT segment_type, partition_name, TO_CHAR(relative_fno), TO_CHAR(block_id), TO_CHAR(blocks) "
 	    "FROM dba_extents WHERE owner = :1 AND segment_name = :2 "
 	    "AND segment_type IN ('TABLE', 'TABLE PARTITION', 'TABLE SUBPARTITION')",
 	    {source.owner, source.name});
 	if (extent_rows.empty()) {
-		return {};
+		slices.clear();
+		return true;
 	}
 	// Data object of each segment, by (segment type, partition name); NULL names read as ""
 	std::map<std::pair<std::string, std::string>, uint32_t> objects;
@@ -177,7 +181,7 @@ std::vector<Slice> SlicesFromDbaExtents(OciSession &session, const OracleTableDe
 	for (const auto &row : extent_rows) {
 		const auto object = objects.find({row[0], row[1]});
 		if (object == objects.end()) {
-			continue; // partition dropped between the two queries
+			return false;
 		}
 		SegmentExtent extent;
 		extent.data_object_id = object->second;
@@ -187,7 +191,8 @@ std::vector<Slice> SlicesFromDbaExtents(OciSession &session, const OracleTableDe
 		extents.push_back(extent);
 		largest = std::max(largest, object_blocks[extent.data_object_id] += extent.blocks);
 	}
-	return BuildRowidSlices(std::move(extents), TargetBlocks(largest, sessions));
+	slices = BuildRowidSlices(std::move(extents), TargetBlocks(largest, sessions));
+	return true;
 }
 
 // Largest BLOCKS statistic of one segment: subpartitions, else partitions, else the table
@@ -230,9 +235,9 @@ void DropTaskQuietly(OciSession &session, const std::string &task) {
 }
 
 // ROWID ranges from DBMS_PARALLEL_EXECUTE.CREATE_CHUNKS_BY_ROWID (inclusive bounds). The task is dropped on every
-// path once created.
+// path once created; when that drop fails after the chunks were read, the chunks are kept and drop_failure says so.
 std::vector<Slice> SlicesFromParallelExecute(OciSession &session, const OracleTableDescription &source,
-                                             uint32_t sessions) {
+                                             uint32_t sessions, std::string &drop_failure) {
 	const uint64_t chunk_blocks = TargetBlocks(LargestSegmentStatistic(session, source), sessions);
 	const std::string task = TaskName();
 	std::vector<std::vector<std::string>> rows;
@@ -254,7 +259,11 @@ std::vector<Slice> SlicesFromParallelExecute(OciSession &session, const OracleTa
 		DropTaskQuietly(session, task);
 		throw;
 	}
-	DropTask(session, task);
+	try {
+		DropTask(session, task);
+	} catch (const OracleError &e) {
+		drop_failure = "task " + task + " not dropped: " + OracleMessage(e);
+	}
 	std::vector<Slice> slices;
 	slices.reserve(rows.size());
 	for (const auto &row : rows) {
@@ -280,10 +289,12 @@ bool PlanExtents(OciSession &session, const OracleTableDescription &source, uint
 	}
 	std::string dba_message, dba_code;
 	try {
-		plan.slices = SlicesFromDbaExtents(session, source, sessions);
-		plan.strategy = SplitStrategy::kExtents;
-		AddNote(plan, "extents from DBA_EXTENTS");
-		return true;
+		if (SlicesFromDbaExtents(session, source, sessions, plan.slices)) {
+			plan.strategy = SplitStrategy::kExtents;
+			AddNote(plan, "extents from DBA_EXTENTS");
+			return true;
+		}
+		dba_message = dba_code = "segments without a data object in ALL_OBJECTS";
 	} catch (const OracleError &e) {
 		if (e.ora_code != kTableNotFound && e.ora_code != kInsufficientPrivileges) {
 			throw;
@@ -292,9 +303,13 @@ bool PlanExtents(OciSession &session, const OracleTableDescription &source, uint
 		dba_code = OracleCode(e);
 	}
 	try {
-		plan.slices = SlicesFromParallelExecute(session, source, sessions);
+		std::string drop_failure;
+		plan.slices = SlicesFromParallelExecute(session, source, sessions, drop_failure);
 		plan.strategy = SplitStrategy::kExtents;
 		AddNote(plan, "extents from DBMS_PARALLEL_EXECUTE (DBA_EXTENTS: " + dba_code + ")");
+		if (!drop_failure.empty()) {
+			AddNote(plan, "DBMS_PARALLEL_EXECUTE " + drop_failure);
+		}
 		return true;
 	} catch (const OracleError &e) {
 		error = "split 'extents' needs DBA_EXTENTS or DBMS_PARALLEL_EXECUTE: DBA_EXTENTS: " + dba_message +
@@ -308,8 +323,7 @@ bool PlanExtents(OciSession &session, const OracleTableDescription &source, uint
 
 std::string ReadCurrentScn(OciSession &session) {
 	std::string failures;
-	int32_t ora_code = 0;
-	return ReadScn(session, failures, ora_code);
+	return ReadScn(session, failures);
 }
 
 WorkPlan PlanWork(OciSession &session, const OracleTableDescription &source, SplitStrategy split, SnapshotMode snapshot,
