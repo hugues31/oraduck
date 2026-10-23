@@ -55,6 +55,7 @@ if ! docker container inspect "$NAME" >/dev/null 2>&1; then
 		-e INIT_SGA_SIZE=3072 -e INIT_PGA_SIZE=1024 \
 		-e ENABLE_ARCHIVELOG=false \
 		-e BENCH_PASSWORD="$ORADUCK_ORACLE_PASSWORD" \
+		-e READER_PASSWORD="$ORADUCK_ORACLE_READER_PASSWORD" \
 		-v "$ORADATA:/opt/oracle/oradata" \
 		-v "$ROOT/infra/oracle/setup:/opt/oracle/scripts/setup:ro" \
 		"$IMAGE" >/dev/null

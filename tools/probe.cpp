@@ -19,7 +19,6 @@ namespace {
 
 constexpr int64_t kRows = 1000000;
 constexpr ub4 kMaxArrayRows = 8192;
-constexpr ub2 kInternalTimestamp = 180; // internal TIMESTAMP type (not documented for direct path)
 
 OracleCredentials Credentials() {
 	auto get = [](const char *name) {

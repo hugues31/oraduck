@@ -56,3 +56,19 @@ TEST_CASE("Missing table", "[oracle]") {
 	OciSession session(TestCredentials());
 	CHECK_THROWS_WITH(DescribeTarget(session, ParseTargetName("N_EXISTE_PAS")), Catch::Contains("not found"));
 }
+
+TEST_CASE("The fetch functions are loaded", "[session]") {
+	CHECK(Oci().OCIDefineByPos2 != nullptr);
+	CHECK(Oci().OCIDefineDynamic != nullptr);
+	CHECK(Oci().OCIBreak != nullptr);
+	CHECK(Oci().OCIReset != nullptr);
+}
+
+TEST_CASE("The test database has the read-path privileges", "[session]") {
+	OciSession session(TestCredentials());
+	CHECK(Scalar(session, "SELECT COUNT(*) FROM v$mystat WHERE ROWNUM = 1") == "1");
+	CHECK(Scalar(session, "SELECT COUNT(*) FROM user_ts_quotas WHERE tablespace_name = 'BENCH_SMALL'") == "1");
+	OciSession reader(ReaderCredentials());
+	CHECK_THROWS_WITH(reader.QueryStrings("SELECT COUNT(*) FROM dba_extents WHERE ROWNUM = 1"),
+	                  Catch::Contains("ORA-00942"));
+}

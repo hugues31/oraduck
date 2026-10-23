@@ -18,6 +18,7 @@ typedef signed short sb2;
 typedef unsigned int ub4;
 typedef signed int sb4;
 typedef signed int sword;
+typedef long long sb8;
 typedef unsigned char OraText;
 
 // Opaque handles
@@ -47,11 +48,20 @@ constexpr ub4 OCI_DEFAULT = 0;
 constexpr ub4 OCI_THREADED = 1;
 constexpr ub4 OCI_NTV_SYNTAX = 1;
 constexpr ub2 OCI_FETCH_NEXT = 2;
+constexpr ub4 OCI_DYNAMIC_FETCH = 2;
+constexpr ub4 OCI_DESCRIBE_ONLY = 0x10;
+
+// Piece values of dynamic defines
+constexpr ub1 OCI_ONE_PIECE = 0;
+constexpr ub1 OCI_FIRST_PIECE = 1;
+constexpr ub1 OCI_NEXT_PIECE = 2;
+constexpr ub1 OCI_LAST_PIECE = 3;
 
 // Handle and descriptor types
 constexpr ub4 OCI_HTYPE_ENV = 1;
 constexpr ub4 OCI_HTYPE_ERROR = 2;
 constexpr ub4 OCI_HTYPE_STMT = 4;
+constexpr ub4 OCI_HTYPE_DEFINE = 6;
 constexpr ub4 OCI_HTYPE_DIRPATH_CTX = 14;
 constexpr ub4 OCI_HTYPE_DIRPATH_COLUMN_ARRAY = 15;
 constexpr ub4 OCI_HTYPE_DIRPATH_STREAM = 16;
@@ -63,7 +73,10 @@ constexpr ub4 OCI_ATTR_DATA_TYPE = 2;
 constexpr ub4 OCI_ATTR_NAME = 4;
 constexpr ub4 OCI_ATTR_ROW_COUNT = 9;
 constexpr ub4 OCI_ATTR_SCHEMA_NAME = 9;
+constexpr ub4 OCI_ATTR_PREFETCH_ROWS = 11;
+constexpr ub4 OCI_ATTR_PREFETCH_MEMORY = 13;
 constexpr ub4 OCI_ATTR_PARAM_COUNT = 18;
+constexpr ub4 OCI_ATTR_CHARSET_FORM = 32;
 constexpr ub4 OCI_ATTR_DATEFORMAT = 75;
 constexpr ub4 OCI_ATTR_BUF_SIZE = 77;
 constexpr ub4 OCI_ATTR_DIRPATH_PARALLEL = 80;
@@ -72,6 +85,11 @@ constexpr ub4 OCI_ATTR_COL_COUNT = 82;
 constexpr ub4 OCI_ATTR_NUM_COLS = 102;
 constexpr ub4 OCI_ATTR_LIST_COLUMNS = 103;
 constexpr ub4 OCI_ATTR_DIRPATH_SKIPINDEX_METHOD = 145;
+constexpr ub4 OCI_ATTR_ROWS_FETCHED = 197;
+
+// Character set forms (OCI_ATTR_CHARSET_FORM)
+constexpr ub1 SQLCS_IMPLICIT = 1;
+constexpr ub1 SQLCS_NCHAR = 2;
 
 // Values of OCI_ATTR_DIRPATH_SKIPINDEX_METHOD
 constexpr ub1 OCI_DIRPATH_INDEX_MAINT_SKIP_ALL = 4; // sqlldr skip_index_maintenance=true: indexes left unusable
@@ -89,6 +107,19 @@ constexpr ub2 SQLT_DAT = 12;
 constexpr ub2 SQLT_BFLOAT = 21;
 constexpr ub2 SQLT_BDOUBLE = 22;
 constexpr ub2 SQLT_UIN = 68;
+constexpr ub2 SQLT_BIN = 23;
+constexpr ub2 SQLT_LVC = 94;
+constexpr ub2 SQLT_LVB = 95;
+constexpr ub2 SQLT_AFC = 96;
+constexpr ub2 SQLT_CLOB = 112;
+constexpr ub2 SQLT_BLOB = 113;
+constexpr ub2 SQLT_TIMESTAMP = 187;
+constexpr ub2 SQLT_TIMESTAMP_TZ = 188;
+constexpr ub2 kInternalTimestamp = 180; // internal TIMESTAMP type (not documented for direct path)
+
+// Callback of a dynamic define (OCIDefineDynamic): supplies the buffer of each piece
+typedef sb4 (*OCICallbackDefine)(void *octxp, OCIDefine *defnp, ub4 iter, void **bufpp, ub4 **alenp, ub1 *piecep,
+                                 void **indp, ub2 **rcodep);
 
 struct OciApi {
 	sword (*OCIEnvNlsCreate)(OCIEnv **envp, ub4 mode, void *ctxp, void *(*malocfp)(void *ctxp, size_t size),
@@ -121,6 +152,11 @@ struct OciApi {
 	                      ub4 mode);
 	sword (*OCIDefineByPos)(OCIStmt *stmtp, OCIDefine **defnp, OCIError *errhp, ub4 position, void *valuep,
 	                        sb4 value_sz, ub2 dty, void *indp, ub2 *rlenp, ub2 *rcodep, ub4 mode);
+	sword (*OCIDefineByPos2)(OCIStmt *stmtp, OCIDefine **defnp, OCIError *errhp, ub4 position, void *valuep,
+	                         sb8 value_sz, ub2 dty, void *indp, ub4 *rlenp, ub2 *rcodep, ub4 mode);
+	sword (*OCIDefineDynamic)(OCIDefine *defnp, OCIError *errhp, void *octxp, OCICallbackDefine ocbfp);
+	sword (*OCIBreak)(void *hndlp, OCIError *errhp);
+	sword (*OCIReset)(void *hndlp, OCIError *errhp);
 	sword (*OCIDirPathPrepare)(OCIDirPathCtx *dpctx, OCISvcCtx *svchp, OCIError *errhp);
 	sword (*OCIDirPathColArrayEntrySet)(OCIDirPathColArray *dpca, OCIError *errhp, ub4 rownum, ub2 col_idx,
 	                                    ub1 *cvalp, ub4 clen, ub1 cflg);

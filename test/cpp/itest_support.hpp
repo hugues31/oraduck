@@ -6,16 +6,24 @@
 #include <stdexcept>
 #include <string>
 
+inline std::string RequiredEnv(const char *name) {
+	const char *value = std::getenv(name);
+	if (!value || !*value) {
+		throw std::runtime_error(std::string(name) + " is not set: run 'source env.sh'");
+	}
+	return std::string(value);
+}
+
 // Test database credentials (variables set by env.sh)
 inline oraduck::OracleCredentials TestCredentials() {
-	auto get = [](const char *name) {
-		const char *value = std::getenv(name);
-		if (!value || !*value) {
-			throw std::runtime_error(std::string(name) + " is not set: run 'source env.sh'");
-		}
-		return std::string(value);
-	};
-	return {get("ORADUCK_ORACLE_USER"), get("ORADUCK_ORACLE_PASSWORD"), get("ORADUCK_ORACLE_DSN")};
+	return {RequiredEnv("ORADUCK_ORACLE_USER"), RequiredEnv("ORADUCK_ORACLE_PASSWORD"),
+	        RequiredEnv("ORADUCK_ORACLE_DSN")};
+}
+
+// Credentials of the reader user: CREATE SESSION only, no dictionary access
+inline oraduck::OracleCredentials ReaderCredentials() {
+	return {RequiredEnv("ORADUCK_ORACLE_READER_USER"), RequiredEnv("ORADUCK_ORACLE_READER_PASSWORD"),
+	        RequiredEnv("ORADUCK_ORACLE_DSN")};
 }
 
 // Drops the table if it exists; table may be a double-quoted name.
