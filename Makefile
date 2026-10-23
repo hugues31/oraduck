@@ -19,7 +19,7 @@ CATCH_FLAGS := -I$(PROJ_DIR)duckdb/third_party/catch
 # OCI is loaded at run time (src/oci_api.cpp, in PURE_SRCS): Instant Client in LD_LIBRARY_PATH
 OCI_LIBS = -ldl -pthread
 ORADUCK_HEADERS = $(wildcard src/include/oraduck/*.hpp)
-PURE_SRCS := src/oracle_encoding.cpp src/oracle_names.cpp src/oci_api.cpp
+PURE_SRCS := src/oracle_encoding.cpp src/oracle_decoding.cpp src/oracle_names.cpp src/oci_api.cpp
 OCI_SRCS = $(wildcard src/oci.cpp src/oci_session.cpp src/describe_target.cpp src/direct_path_loader.cpp)
 UNIT_SRCS = test/cpp/catch_main.cpp $(wildcard test/cpp/test_*.cpp)
 ITEST_SRCS = test/cpp/catch_main.cpp $(wildcard test/cpp/itest_*.cpp)

@@ -17,6 +17,7 @@ set(EXTENSION_SOURCES
     src/oraduck_extension.cpp
     src/oraduck_secret.cpp
     src/oracle_encoding.cpp
+    src/oracle_decoding.cpp
     src/oracle_names.cpp
     src/oci_api.cpp
     src/oci.cpp
