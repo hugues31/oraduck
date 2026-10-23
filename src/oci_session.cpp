@@ -14,6 +14,8 @@ struct StmtGuard {
 	}
 };
 
+constexpr ub4 kPrefetchRows = 1024;
+
 const OraText *Text(const std::string &value) {
 	return reinterpret_cast<const OraText *>(value.data());
 }
@@ -67,6 +69,11 @@ std::vector<std::vector<std::string>> OciSession::QueryStrings(const std::string
 		                      OCI_DEFAULT),
 		         err_, "OCIBindByPos");
 	}
+	// Rows come one by one: prefetch them so that a result of N rows does not cost N round trips (the extent map
+	// of a large table has thousands of rows)
+	ub4 prefetch_rows = kPrefetchRows;
+	CheckOci(Oci().OCIAttrSet(stmt, OCI_HTYPE_STMT, &prefetch_rows, 0, OCI_ATTR_PREFETCH_ROWS, err_), err_,
+	         "OCI_ATTR_PREFETCH_ROWS");
 	CheckOci(Oci().OCIStmtExecute(svc_, stmt, err_, 0, 0, nullptr, nullptr, OCI_DEFAULT), err_, "OCIStmtExecute");
 	ub4 ncols = 0;
 	CheckOci(Oci().OCIAttrGet(stmt, OCI_HTYPE_STMT, &ncols, nullptr, OCI_ATTR_PARAM_COUNT, err_), err_,

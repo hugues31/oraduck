@@ -23,6 +23,7 @@ GRANT SELECT ON sys.v_\$mystat TO bench;
 GRANT SELECT ON sys.v_\$statname TO bench;
 GRANT SELECT ON sys.v_\$segment_statistics TO bench;
 GRANT SELECT ON sys.v_\$sql TO bench;
+GRANT SELECT ON sys.dba_extents TO bench;
 GRANT CREATE SESSION TO reader;
 ALTER USER reader IDENTIFIED BY "${READER_PASSWORD}";
 EXIT

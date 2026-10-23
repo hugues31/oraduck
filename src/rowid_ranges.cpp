@@ -42,6 +42,7 @@ uint64_t TargetBlocks(uint64_t largest_segment_blocks, uint32_t sessions) {
 }
 
 std::vector<Slice> BuildRowidSlices(std::vector<SegmentExtent> extents, uint64_t target_blocks) {
+	target_blocks = std::max<uint64_t>(target_blocks, 1);
 	std::map<uint32_t, std::vector<SegmentExtent>> by_object;
 	for (const auto &e : extents) {
 		by_object[e.data_object_id].push_back(e);
@@ -57,16 +58,22 @@ std::vector<Slice> BuildRowidSlices(std::vector<SegmentExtent> extents, uint64_t
 		current.slice.kind = SliceKind::kRowidRange;
 		current.slice.rowid_lo = EncodeRowid(object, 0, 0, 0);
 		for (const auto &e : list) {
-			if (current.blocks >= target_blocks) {
-				// This extent opens the next unit
-				current.slice.rowid_hi = EncodeRowid(object, e.relative_fno, e.block_id, 0);
-				const std::string boundary = current.slice.rowid_hi;
-				units.push_back(current);
-				current = Unit();
-				current.slice.kind = SliceKind::kRowidRange;
-				current.slice.rowid_lo = boundary;
+			// Fill units of target_blocks, cutting the extent at a block boundary when it does not fit
+			uint64_t offset = 0;
+			while (offset < e.blocks) {
+				if (current.blocks >= target_blocks) {
+					const std::string boundary =
+					    EncodeRowid(object, e.relative_fno, static_cast<uint32_t>(e.block_id + offset), 0);
+					current.slice.rowid_hi = boundary;
+					units.push_back(std::move(current));
+					current = Unit();
+					current.slice.kind = SliceKind::kRowidRange;
+					current.slice.rowid_lo = boundary;
+				}
+				const uint64_t take = std::min<uint64_t>(e.blocks - offset, target_blocks - current.blocks);
+				current.blocks += take;
+				offset += take;
 			}
-			current.blocks += e.blocks;
 		}
 		if (object == 0xFFFFFFFFu) {
 			// No next object number: close the last range on the highest possible ROWID
