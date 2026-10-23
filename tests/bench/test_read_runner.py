@@ -56,3 +56,21 @@ def test_timeout_is_recorded_then_the_method_is_skipped(tmp_path):
     assert timeouts == {("x", 10, 5)}
     records, _ = run(tmp_path, ["oraduck", "x"], runs=1, timeouts=timeouts)
     assert [(r["type"], r["method"]) for r in records][0] == ("skipped", "x")
+
+
+def test_out_db_is_deleted_after_the_last_run(tmp_path, monkeypatch):
+    from oraduck_bench import read_methods
+    called = []
+    monkeypatch.setattr(read_methods, "reset_out_db", lambda: called.append(1))
+    run(tmp_path, ["oraduck"], runs=1)
+    assert called == [1]
+
+
+def test_read_external_validates_its_arguments(monkeypatch):
+    from oraduck_bench import cli
+    monkeypatch.setenv("ORADUCK_EXTERNAL_PASSWORD", "x")
+    base = ["read-external", "--dsn", "d", "--user", "u", "--where", "1=1"]
+    with pytest.raises(SystemExit, match="OWNER.TABLE"):
+        cli.main(base + ["--table", "A.B'; DROP"])
+    with pytest.raises(SystemExit, match="--runs"):
+        cli.main(base + ["--table", "A.B", "--runs", "0"])

@@ -28,3 +28,16 @@ def test_qualified_table_keeps_its_owner():
 
 def test_method_names():
     assert read_methods.METHODS == ("oraduck", "oraduck_scan")
+
+
+def test_read_cases_are_the_two_one_million_row_cases():
+    from oraduck_bench import read_config
+    assert read_config.READ_CASES == ((1_000_000, 50), (1_000_000, 550))
+
+
+def test_duckdb_errors_hide_passwords():
+    from oraduck_bench import duck
+    text = ("CREATE SECRET bench (TYPE oraduck, USER 'bench', PASSWORD 'S3cret!', DSN 'h:1521/s');\n"
+            "ATTACH 'bench/S3cret!@h:1521/s' AS r (TYPE oracle);")
+    out = duck.redact(text)
+    assert "S3cret" not in out and "PASSWORD '***'" in out and "bench/***@h" in out

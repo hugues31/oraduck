@@ -22,6 +22,15 @@ def strip_warnings(stdout: str) -> str:
     return _WARNING.sub("", stdout)
 
 
+_PASSWORD = re.compile(r"(PASSWORD\s+')[^']*(')", re.IGNORECASE)
+_CONNECT_STRING = re.compile(r"([\w$#.-]+/)[^\s@'\"/]+(@)")
+
+
+def redact(text: str) -> str:
+    """Hides the passwords of CREATE SECRET statements and of user/password@dsn connect strings."""
+    return _CONNECT_STRING.sub(r"\1***\2", _PASSWORD.sub(r"\1***\2", text))
+
+
 class DuckDBError(RuntimeError):
     pass
 
@@ -44,7 +53,8 @@ def run(sql: str, db: Path | str = ":memory:", csv_output: bool = False, timeout
     except subprocess.TimeoutExpired as exc:  # the CLI was killed
         raise MethodTimeout(f"duckdb killed after {timeout_s} s") from exc
     if proc.returncode != 0:
-        raise DuckDBError(f"duckdb failed ({proc.returncode}):\n{proc.stderr.strip()}\n--- script ---\n{sql[:2000]}")
+        raise DuckDBError(redact(
+            f"duckdb failed ({proc.returncode}):\n{proc.stderr.strip()}\n--- script ---\n{sql[:2000]}"))
     return strip_warnings(proc.stdout)
 
 

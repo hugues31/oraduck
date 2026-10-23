@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from pathlib import Path
 
 from . import read_runner, runner
 from .config import (COLS, RESULTS, ROWS, SCALING_CASE, SCALING_THREADS, THREADS, TUNE_STREAM_SIZES,
                      OracleConfig)
 from .read_config import READ_CASES, READ_RUNS
+
+
+TABLE_NAME = re.compile(r"^[A-Za-z0-9_$#]+(\.[A-Za-z0-9_$#]+)?$")
 
 
 def _check_affinity() -> None:
@@ -24,11 +28,18 @@ def _read_external(args: argparse.Namespace) -> int:
 
     from . import read_methods
 
+    if not TABLE_NAME.match(args.table):
+        raise SystemExit(f"--table {args.table!r}: expected OWNER.TABLE with letters, digits, _, $ and #")
+    if args.runs < 1:
+        raise SystemExit("--runs must be at least 1")
     password = os.environ.get("ORADUCK_EXTERNAL_PASSWORD")
     if not password:
         raise SystemExit("ORADUCK_EXTERNAL_PASSWORD is not set")
     cfg = OracleConfig(args.user, password, args.dsn)
-    runs = [read_methods.run_oraduck(cfg, args.table, 8, args.where) for _ in range(args.runs)]
+    try:
+        runs = [read_methods.run_oraduck(cfg, args.table, 8, args.where) for _ in range(args.runs)]
+    finally:
+        read_methods.reset_out_db()
     times = [m.total_s for m in runs]
     rows, size = runs[-1].extra["rows"], runs[-1].extra["db_bytes"]
     median = statistics.median(times)
@@ -46,8 +57,8 @@ def main(argv: list[str] | None = None) -> int:
     external = sub.add_parser("read-external")
     external.add_argument("--dsn", required=True)
     external.add_argument("--user", required=True)
-    external.add_argument("--table", required=True, help="OWNER.TABLE")
-    external.add_argument("--where", required=True, help="SQL predicate of the partition to read")
+    external.add_argument("--table", required=True, help="OWNER.TABLE (plain identifiers only)")
+    external.add_argument("--where", required=True, help="SQL predicate of the partition to read, used as given (not validated, by design)")
     external.add_argument("--runs", type=int, default=3)
     report_parser = sub.add_parser("report")
     report_parser.add_argument("files", nargs="*", type=Path)

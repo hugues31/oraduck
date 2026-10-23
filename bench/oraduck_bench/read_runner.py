@@ -67,28 +67,31 @@ def run_read_case(
             print(f"{READ_SUITE} {table} {method} N={threads}: not run", flush=True)
         else:
             active.append(method)
-    for round_index in range(runs + (1 if warmup else 0)):
-        is_warmup = warmup and round_index == 0
-        for method in list(active):
-            if method not in active:
-                continue
-            at = time.strftime("%Y-%m-%dT%H:%M:%S")
-            try:
-                m = run_method(cfg, method, table, threads, where, timeout_s)
-            except duck.MethodTimeout:
-                timeouts.add((method, nrows, ncols))
-                active.remove(method)
-                records.append(_append(out, {"type": "timeout", **case, "method": method, "threads": threads,
-                                             "warmup": is_warmup, "limit_s": timeout_s, "at": at}))
-                print(f"{READ_SUITE} {table} {method} N={threads}: stopped after {timeout_s} s", flush=True)
-                continue
-            got = duck_checksums()  # not timed
-            if got != expected:
-                raise ChecksumMismatch(f"{method} N={threads} {table} run {round_index}: expected {expected}, "
-                                       f"got {got}")
-            m = replace(m, nrows=nrows, ncols=ncols)
-            records.append(_append(out, {"type": "measure", "suite": READ_SUITE, "index": round_index,
-                                         "warmup": is_warmup, "at": at, **asdict(m)}))
-            print(f"{READ_SUITE} {table} {method} N={threads}{' (warm-up)' if is_warmup else ''}: "
-                  f"{m.total_s:.3f} s", flush=True)
+    try:
+        for round_index in range(runs + (1 if warmup else 0)):
+            is_warmup = warmup and round_index == 0
+            for method in list(active):
+                if method not in active:
+                    continue
+                at = time.strftime("%Y-%m-%dT%H:%M:%S")
+                try:
+                    m = run_method(cfg, method, table, threads, where, timeout_s)
+                except duck.MethodTimeout:
+                    timeouts.add((method, nrows, ncols))
+                    active.remove(method)
+                    records.append(_append(out, {"type": "timeout", **case, "method": method, "threads": threads,
+                                                 "warmup": is_warmup, "limit_s": timeout_s, "at": at}))
+                    print(f"{READ_SUITE} {table} {method} N={threads}: stopped after {timeout_s} s", flush=True)
+                    continue
+                got = duck_checksums()  # not timed
+                if got != expected:
+                    raise ChecksumMismatch(f"{method} N={threads} {table} run {round_index}: expected {expected}, "
+                                           f"got {got}")
+                m = replace(m, nrows=nrows, ncols=ncols)
+                records.append(_append(out, {"type": "measure", "suite": READ_SUITE, "index": round_index,
+                                             "warmup": is_warmup, "at": at, **asdict(m)}))
+                print(f"{READ_SUITE} {table} {method} N={threads}{' (warm-up)' if is_warmup else ''}: "
+                      f"{m.total_s:.3f} s", flush=True)
+    finally:
+        read_methods.reset_out_db()
     return records

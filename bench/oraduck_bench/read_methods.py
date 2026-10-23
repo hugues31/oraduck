@@ -38,18 +38,21 @@ def oraduck_sql(cfg: OracleConfig, table: str, threads: int, where: str, via: st
     return setup, f"CREATE TABLE t AS SELECT * FROM {source} WHERE {where};"
 
 
-def _reset_out_db() -> None:
+def reset_out_db() -> None:
     for suffix in ("", ".wal"):
         READ_OUT_DB.with_name(READ_OUT_DB.name + suffix).unlink(missing_ok=True)
 
 
 def run_oraduck(cfg: OracleConfig, table: str, threads: int, where: str, via: str = "attach",
                 timeout_s: float | None = READ_TIMEOUT_S, nrows: int = 0, ncols: int = 0) -> Measurement:
-    _reset_out_db()
+    """Time of the CTAS alone (`timed` in extra): the ATTACH and secret are set up untimed, the bind/describe of
+    the first scan is inside the timer. The count and the file size are read afterwards, untimed."""
+    reset_out_db()
     setup, statement = oraduck_sql(cfg, table, threads, where, via)
     total = duck.timed(setup, statement, READ_OUT_DB, timeout_s=timeout_s)
     rows = int(duck.query("SELECT count(*) FROM t;", READ_OUT_DB)[0][0])
-    extra = {"rows": rows, "db_bytes": READ_OUT_DB.stat().st_size}
+    extra = {"rows": rows, "db_bytes": READ_OUT_DB.stat().st_size,
+             "timed": "CTAS (ATTACH untimed; bind/describe of the first scan included)"}
     return Measurement("oraduck" if via == "attach" else "oraduck_scan", table, nrows, ncols, threads, total,
                        None, extra)
 

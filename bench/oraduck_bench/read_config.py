@@ -5,7 +5,7 @@ from __future__ import annotations
 from .config import WORK
 
 # (rows in the target partition, columns)
-READ_CASES = ((1_000_000, 50), (1_000_000, 550), (7_000_000, 50), (7_000_000, 550))
+READ_CASES = ((1_000_000, 50), (1_000_000, 550))
 TARGET_DATE = "2024-05-07"
 OTHER_DATES = ("2024-05-06", "2024-05-08")
 READ_RUNS = 5
