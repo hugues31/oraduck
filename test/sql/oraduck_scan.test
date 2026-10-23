@@ -1,0 +1,52 @@
+# name: test/sql/oraduck_scan.test
+# description: oraduck_scan argument and option errors detected without Oracle
+# group: [oraduck]
+
+require oraduck
+
+statement error
+SELECT * FROM oraduck_scan('BENCH.T');
+----
+connection parameter is required
+
+statement error
+SELECT * FROM oraduck_scan('BENCH.T', connection := 'absent');
+----
+not found
+
+# Option values are checked before the secret is fetched
+statement error
+SELECT * FROM oraduck_scan('BENCH.T', connection := 'absent', split := 'random');
+----
+<REGEX>:.*split.*auto.*extents.*hash.*none.*
+
+statement error
+SELECT * FROM oraduck_scan('BENCH.T', connection := 'absent', split := 'EXTENTS', snapshot := 'later');
+----
+<REGEX>:.*snapshot.*auto.*scn.*none.*
+
+statement error
+SELECT * FROM oraduck_scan('BENCH.T', connection := 'absent', sessions := 0);
+----
+<REGEX>:.*sessions.*1.*1024.*
+
+statement error
+SELECT * FROM oraduck_scan('BENCH.T', connection := 'absent', sessions := 1025);
+----
+<REGEX>:.*sessions.*1.*1024.*
+
+statement error
+SELECT * FROM oraduck_scan('BENCH.T', connection := 'absent', unconstrained_number := 'BIGINT');
+----
+<REGEX>:.*DOUBLE.*VARCHAR.*DECIMAL.*
+
+# Valid values in any case pass the option checks and reach the secret lookup
+statement error
+SELECT * FROM oraduck_scan('BENCH.T', connection := 'absent', split := 'Hash', snapshot := 'NONE', sessions := 4, unconstrained_number := 'decimal(20, 4)');
+----
+not found
+
+statement error
+SELECT * FROM oraduck_scan('BENCH.T', connection := 'absent', toto := 1);
+----
+toto

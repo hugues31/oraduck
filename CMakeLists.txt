@@ -33,6 +33,8 @@ set(EXTENSION_SOURCES
     src/fetch_cursor.cpp
     src/work_units.cpp
     src/oraduck_copy.cpp
+    src/oraduck_scan.cpp
+    src/scan_vectors.cpp
     src/column_plan.cpp
     src/chunk_writer.cpp)
 

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
+from decimal import Decimal
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,19 +22,22 @@ def env(name: str) -> str:
     return value
 
 
-def secret_sql(name: str = "ora") -> str:
+def secret_sql(name: str = "ora", reader: bool = False) -> str:
+    """CREATE SECRET for the BENCH user, or for the READER user (CREATE SESSION only) when reader is set."""
+    prefix = "ORADUCK_ORACLE_READER" if reader else "ORADUCK_ORACLE"
     return (
-        f"CREATE SECRET {name} (TYPE oraduck, USER '{env('ORADUCK_ORACLE_USER')}', "
-        f"PASSWORD '{env('ORADUCK_ORACLE_PASSWORD')}', DSN '{env('ORADUCK_ORACLE_DSN')}');\n"
+        f"CREATE SECRET {name} (TYPE oraduck, USER '{env(prefix + '_USER')}', "
+        f"PASSWORD '{env(prefix + '_PASSWORD')}', DSN '{env('ORADUCK_ORACLE_DSN')}');\n"
     )
 
 
 def run_duckdb(sql: str, db: str = ":memory:", timeout: float = 600,
-               env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    """Runs a script in the DuckDB CLI; does not raise on SQL failure."""
+               env: dict[str, str] | None = None, json_mode: bool = False) -> subprocess.CompletedProcess[str]:
+    """Runs a script in the DuckDB CLI; does not raise on SQL failure. -no-agent: the same output whether or not an AI
+    agent's environment variable is set."""
     WORKDIR.mkdir(parents=True, exist_ok=True)
     return subprocess.run(
-        [str(DUCKDB), "-batch", "-bail", db],
+        [str(DUCKDB), "-batch", "-bail", "-no-agent"] + (["-json"] if json_mode else []) + [db],
         input=sql,
         text=True,
         capture_output=True,
@@ -39,6 +45,85 @@ def run_duckdb(sql: str, db: str = ":memory:", timeout: float = 600,
         timeout=timeout,
         env=env,
     )
+
+
+def json_documents(text: str) -> list:
+    """Every JSON document printed by the CLI in -json mode, in order."""
+    decoder = json.JSONDecoder(parse_float=Decimal)
+    documents = []
+    pos = 0
+    while True:
+        while pos < len(text) and text[pos] not in "[{":
+            pos += 1
+        if pos >= len(text):
+            return documents
+        document, pos = decoder.raw_decode(text, pos)
+        documents.append(document)
+
+
+# The CLI prints WARNING log entries on stdout (colored), even in -json mode, in the middle of a result
+_WARNING = re.compile(r"(?:\x1b\[[0-9;]*m)*WARNING:\n(?:\x1b\[[0-9;]*m)*(.*?)\n\n(?:\x1b\[[0-9;]*m)*", re.DOTALL)
+
+
+def split_warnings(stdout: str) -> tuple[str, list[str]]:
+    """stdout without the CLI's WARNING blocks, and their messages."""
+    return _WARNING.sub("", stdout), [m.strip() for m in _WARNING.findall(stdout)]
+
+
+def scan_output(sql: str, setup: str = "", reader: bool = False, timeout: float = 600) -> tuple[list[dict], list[str]]:
+    """Runs setup then sql after the ora secret, in -json mode; returns the rows of the last result and the warnings
+    the CLI printed."""
+    proc = run_duckdb(secret_sql(reader=reader) + setup + sql, json_mode=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise AssertionError(f"query failed\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    stdout, warnings = split_warnings(proc.stdout)
+    arrays = [d for d in json_documents(stdout) if isinstance(d, list)]
+    assert arrays, f"no result\nSTDOUT:\n{proc.stdout}"
+    return arrays[-1], warnings
+
+
+def scan_json(sql: str, setup: str = "", reader: bool = False, timeout: float = 600) -> list[dict]:
+    """Runs setup then sql after the ora secret, in -json mode; returns the rows of the last result."""
+    return scan_output(sql, setup, reader, timeout)[0]
+
+
+def scan_error(sql: str, setup: str = "", reader: bool = False) -> str:
+    """Runs setup then sql after the ora secret; returns the error output (the script must fail)."""
+    proc = run_duckdb(secret_sql(reader=reader) + setup + sql)
+    assert proc.returncode != 0, f"query unexpectedly succeeded\nSTDOUT:\n{proc.stdout}"
+    return proc.stderr + proc.stdout
+
+
+def scan_nodes(node: dict | list) -> list[dict]:
+    """extra_info of every oraduck_scan operator (the ones showing "Table") of an EXPLAIN (FORMAT json) tree."""
+    found = []
+    if isinstance(node, list):
+        for child in node:
+            found += scan_nodes(child)
+        return found
+    info = node.get("extra_info", {})
+    if isinstance(info, dict) and "Table" in info:
+        found.append(info)
+    for key in ("children", "operator"):
+        if key in node:
+            found += scan_nodes(node[key])
+    return found
+
+
+def explain_scan(sql: str, setup: str = "", analyze: bool = False, reader: bool = False) -> list[dict]:
+    """Extra info of the oraduck_scan operators of EXPLAIN [ANALYZE] (FORMAT json) sql."""
+    options = "ANALYZE, FORMAT json" if analyze else "FORMAT json"
+    proc = run_duckdb(secret_sql(reader=reader) + setup + f"EXPLAIN ({options}) {sql};\n", json_mode=True)
+    if proc.returncode != 0:
+        raise AssertionError(f"EXPLAIN failed\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    nodes = scan_nodes(json_documents(split_warnings(proc.stdout)[0])[-1])
+    assert nodes, f"no oraduck_scan operator\nSTDOUT:\n{proc.stdout}"
+    return nodes
+
+
+def scan_call(table: str, options: str = "") -> str:
+    """oraduck_scan('<table>', connection := 'ora'[, options])."""
+    return f"oraduck_scan('{table}', connection := 'ora'{', ' + options if options else ''})"
 
 
 def _copy_script(query: str, target: str, options: str, setup: str, secret: bool) -> str:
@@ -92,3 +177,24 @@ class OracleTable:
             f"BEGIN EXECUTE IMMEDIATE 'DROP TABLE {self.name} PURGE'; "
             "EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;"
         )
+
+
+def drop_view(conn, name: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"BEGIN EXECUTE IMMEDIATE 'DROP VIEW {name}'; "
+            "EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;"
+        )
+
+
+def fill_ids(table: OracleTable, rows: int, columns: str = "ID", values: str = "n") -> None:
+    """Inserts rows with n = 1..rows (direct path) and gathers statistics; values are expressions of n."""
+    thousands = (rows + 999) // 1000
+    table.execute(
+        f"INSERT /*+ APPEND */ INTO {table.name} ({columns}) "
+        f"SELECT {values} FROM (SELECT (a.i - 1) * 1000 + b.i AS n FROM "
+        f"(SELECT LEVEL AS i FROM dual CONNECT BY LEVEL <= {thousands}) a, "
+        f"(SELECT LEVEL AS i FROM dual CONNECT BY LEVEL <= 1000) b) WHERE n <= {rows}"
+    )
+    table.conn.commit()
+    table.execute(f"BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, '{table.name}'); END;")
