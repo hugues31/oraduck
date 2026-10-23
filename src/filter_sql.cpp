@@ -3,9 +3,11 @@
 #include "oraduck/errors.hpp"
 #include "oraduck/oracle_encoding.hpp"
 #include "oraduck/read_types.hpp"
+#include "oraduck/read_sql.hpp"
 #include "oraduck/sql_binds.hpp"
 
 #include <cmath>
+#include <cctype>
 #include <cstdlib>
 
 namespace oraduck {
@@ -14,23 +16,39 @@ namespace {
 
 enum class ColumnKind { kNumber, kBinaryFloat, kBinaryDouble, kDate, kTimestamp, kChar, kLob, kOther };
 
+constexpr size_t kMaxInList = 1000;      // Oracle: ORA-01795 above 1000 expressions
+constexpr size_t kMaxBindTextBytes = 4000; // longer text binds are not compared as VARCHAR2
+
 struct ColumnInfo {
 	ColumnKind kind = ColumnKind::kOther;
 	bool national = false;
+	bool binary_collation = true; // string comparisons follow binary order (no column-level collation)
 };
+
+std::string Upper(const std::string &s) {
+	std::string out;
+	for (char c : s) {
+		out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+	}
+	return out;
+}
 
 bool StartsWith(const std::string &s, const char *prefix) {
 	return s.compare(0, std::string(prefix).size(), prefix) == 0;
 }
 
-ColumnInfo Classify(const OracleColumn &c) {
+ColumnInfo Classify(const OracleColumn &c, const std::string &db_charset) {
 	ColumnInfo info;
 	info.national = c.national;
+	const std::string collation = Upper(c.collation);
+	info.binary_collation = collation.empty() || collation == "USING_NLS_COMP" || collation == "BINARY";
 	const std::string &t = c.data_type;
 	if (t == "NUMBER") {
-		// NUMBER without precision is compared exactly by Oracle but as DOUBLE by DuckDB: not pushed.
-		// A scale of -1 is ambiguous (NULL or a real negative scale): not pushed either.
-		if (c.precision >= 0 && c.scale >= 0) {
+		// Pushed only when the read path maps the column to an exact type: Oracle compares exact
+		// decimals, DuckDB compares the DOUBLE it receives otherwise.
+		const auto id = PlanReadColumn(c, UnconstrainedNumber(), db_charset).duck_type.id;
+		if (id == DuckTypeId::kSmallint || id == DuckTypeId::kInteger || id == DuckTypeId::kBigint ||
+		    id == DuckTypeId::kDecimal) {
 			info.kind = ColumnKind::kNumber;
 		}
 	} else if (t == "BINARY_FLOAT") {
@@ -62,14 +80,16 @@ ColumnInfo Classify(const OracleColumn &c) {
 
 struct Builder {
 	const std::vector<OracleColumn> &columns;
+	const std::string &db_charset;
 	bool utf8;
+	bool al32utf8; // string ranges: UTF8 (CESU-8) sorts supplementary characters differently
 	SqlFragment out;
 
 	std::string NextPlaceholder() const {
 		return ":b" + std::to_string(out.binds.size() + 1);
 	}
 
-	// Adds the bind and returns false if it cannot be built.
+	// Adds the bind (placeholder in sql, literal in display).
 	void AddBind(BindValue bind, std::string &sql, std::string &display, const char *wrap_prefix = "",
 	             const char *wrap_suffix = "", const std::string *display_override = nullptr) {
 		sql += wrap_prefix + NextPlaceholder() + wrap_suffix;
@@ -133,10 +153,11 @@ struct Builder {
 			return true;
 		}
 		case ColumnKind::kChar:
-			if (k.kind != Kind::kString || k.text.empty() || k.text.find('\0') != std::string::npos) {
+			if (k.kind != Kind::kString || k.text.empty() || k.text.size() > kMaxBindTextBytes ||
+			    k.text.find('\0') != std::string::npos || !info.binary_collation) {
 				return false;
 			}
-			if (is_range && (!utf8 || info.national)) {
+			if (is_range && (!al32utf8 || info.national)) {
 				return false;
 			}
 			// Another character set may not represent the constant: only ASCII is pushed
@@ -148,6 +169,10 @@ struct Builder {
 		default:
 			return false;
 		}
+	}
+
+	static int64_t Days(int64_t y, uint32_t m, uint32_t d) {
+		return DaysFromCivil(y, m, d);
 	}
 
 	static bool DateMicros(const FilterConstant &k, int64_t &micros) {
@@ -202,8 +227,8 @@ struct Builder {
 			return false;
 		}
 		const auto &column = columns[node.column];
-		const ColumnInfo info = Classify(column);
-		const std::string quoted = "\"" + column.name + "\"";
+		const ColumnInfo info = Classify(column, db_charset);
+		const std::string quoted = QuoteIdentifier(column.name);
 		if (node.op == FilterOp::kIsNull || node.op == FilterOp::kIsNotNull) {
 			if (info.kind == ColumnKind::kOther && !IsUnconstrainedNumber(column)) {
 				return false;
@@ -220,7 +245,8 @@ struct Builder {
 				return false;
 			}
 			int64_t micros;
-			if (!DateMicros(node.constants[0], micros)) {
+			// d + 1 would raise ORA-01841 at 9999-12-31
+			if (!DateMicros(node.constants[0], micros) || node.constants[0].i64 >= Days(9999, 12, 31)) {
 				return false;
 			}
 			std::string s1, d1, s2, d2;
@@ -231,7 +257,7 @@ struct Builder {
 			return true;
 		}
 		if (node.op == FilterOp::kIn) {
-			if (node.constants.empty()) {
+			if (node.constants.empty() || node.constants.size() > kMaxInList) {
 				return false;
 			}
 			sql = "(" + quoted + " IN (";
@@ -293,7 +319,7 @@ struct Builder {
 
 std::optional<SqlFragment> TranslateFilter(const FilterNode &node, const std::vector<OracleColumn> &columns,
                                            const std::string &db_charset) {
-	Builder builder {columns, IsUtf8Charset(db_charset), {}};
+	Builder builder {columns, db_charset, IsUtf8Charset(db_charset), Upper(db_charset) == "AL32UTF8", {}};
 	try {
 		std::string sql, display;
 		if (!builder.Node(node, sql, display)) {

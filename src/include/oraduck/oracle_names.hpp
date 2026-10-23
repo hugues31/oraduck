@@ -31,6 +31,7 @@ struct OracleColumn {
 	bool nullable = true;
 	uint32_t char_length = 0; // ALL_TAB_COLUMNS.CHAR_LENGTH (read path)
 	bool national = false;    // CHARACTER_SET_NAME = 'NCHAR_CS' (read path)
+	std::string collation;    // ALL_TAB_COLUMNS.COLLATION; empty when NULL (read path)
 };
 
 struct TableDescription {

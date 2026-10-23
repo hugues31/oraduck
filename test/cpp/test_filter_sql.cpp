@@ -12,8 +12,10 @@ namespace {
 
 using Kind = FilterConstant::Kind;
 
-OracleColumn Col(const std::string &name, const std::string &type, int p = -1, int s = -1, bool national = false) {
+OracleColumn Col(const std::string &name, const std::string &type, int p = -1, int s = -1, bool national = false,
+                 const std::string &collation = "") {
 	OracleColumn c;
+	c.collation = collation;
 	c.name = name;
 	c.data_type = type;
 	c.precision = p;
@@ -42,6 +44,13 @@ const std::vector<OracleColumn> &Columns() {
 	    Col("NCH", "NCHAR", -1, -1, true),
 	    Col("TSL", "TIMESTAMP(6) WITH LOCAL TIME ZONE"),
 	    Col("RAWC", "RAW"),
+	    Col("BF", "BINARY_FLOAT"),
+	    Col("STAR0", "NUMBER", -1, 0),
+	    Col("NEGS", "NUMBER", 5, -2),
+	    Col("HUGES", "NUMBER", 10, 40),
+	    Col("CI", "VARCHAR2", -1, -1, false, "BINARY_CI"),
+	    Col("NLSC", "VARCHAR2", -1, -1, false, "USING_NLS_COMP"),
+	    Col("BIN", "VARCHAR2", -1, -1, false, "BINARY"),
 	};
 	return columns;
 }
@@ -284,4 +293,61 @@ TEST_CASE("Partition key filters are pushed", "[filter_sql]") {
 	CHECK(Translate(Leaf(FilterOp::kIn, 1, {Text("A"), Text("B")})));
 	CHECK(Translate(Leaf(FilterOp::kEq, 2, {Integer(7)})));
 	CHECK_FALSE(Translate(Leaf(FilterOp::kEq, 1, {Integer(1)})));
+}
+
+TEST_CASE("String ranges are pushed on AL32UTF8 only, not on UTF8 (CESU-8)", "[filter_sql]") {
+	CHECK(Translate(Leaf(FilterOp::kGt, 1, {Text("A")}), "AL32UTF8"));
+	CHECK_FALSE(Translate(Leaf(FilterOp::kGt, 1, {Text("A")}), "UTF8"));
+	CHECK(Translate(Leaf(FilterOp::kEq, 1, {Text("\xF0\x9F\x98\x80")}), "UTF8"));
+	CHECK(Translate(Leaf(FilterOp::kIn, 1, {Text("A")}), "UTF8"));
+}
+
+TEST_CASE("IN lists above 1000 constants are not pushed", "[filter_sql]") {
+	std::vector<FilterConstant> constants;
+	for (int i = 0; i < 1000; i++) {
+		constants.push_back(Integer(i));
+	}
+	auto f = Translate(Leaf(FilterOp::kIn, 2, constants));
+	REQUIRE(f);
+	CHECK(f->binds.size() == 1000);
+	constants.push_back(Integer(1000));
+	CHECK_FALSE(Translate(Leaf(FilterOp::kIn, 2, constants)));
+}
+
+TEST_CASE("NUMBER pushability follows the read mapping", "[filter_sql]") {
+	CHECK(Translate(Leaf(FilterOp::kEq, 16, {Integer(1)})));  // NUMBER(*,0)
+	CHECK(Translate(Leaf(FilterOp::kEq, 17, {Integer(100)}))); // NUMBER(5,-2)
+	CHECK_FALSE(Translate(Leaf(FilterOp::kEq, 18, {Integer(1)}))); // NUMBER(10,40) is read as DOUBLE
+	CHECK_FALSE(Translate(Leaf(FilterOp::kEq, 3, {Integer(1)})));  // unconstrained
+	CHECK(Translate(Leaf(FilterOp::kIsNull, 18)));
+}
+
+TEST_CASE("Column collation other than binary blocks string comparisons", "[filter_sql]") {
+	CHECK_FALSE(Translate(Leaf(FilterOp::kEq, 19, {Text("a")})));
+	CHECK_FALSE(Translate(Leaf(FilterOp::kIn, 19, {Text("a")})));
+	CHECK_FALSE(Translate(Leaf(FilterOp::kGt, 19, {Text("a")})));
+	CHECK(Translate(Leaf(FilterOp::kIsNull, 19)));
+	CHECK(Translate(Leaf(FilterOp::kEq, 20, {Text("a")})));
+	CHECK(Translate(Leaf(FilterOp::kGt, 20, {Text("a")})));
+	CHECK(Translate(Leaf(FilterOp::kEq, 21, {Text("a")})));
+}
+
+TEST_CASE("kDateEq is not pushed at 9999-12-31", "[filter_sql]") {
+	CHECK(Translate(Leaf(FilterOp::kDateEq, 0, {Date(9999, 12, 30)})));
+	CHECK_FALSE(Translate(Leaf(FilterOp::kDateEq, 0, {Date(9999, 12, 31)})));
+}
+
+TEST_CASE("Text constants above 4000 bytes are not pushed", "[filter_sql]") {
+	CHECK(Translate(Leaf(FilterOp::kEq, 1, {Text(std::string(4000, 'a'))})));
+	CHECK_FALSE(Translate(Leaf(FilterOp::kEq, 1, {Text(std::string(4001, 'a'))})));
+}
+
+TEST_CASE("BINARY_FLOAT and NCHAR columns", "[filter_sql]") {
+	auto f = Translate(Leaf(FilterOp::kGe, 15, {Double(0.5)}));
+	REQUIRE(f);
+	CHECK(f->binds[0].dty == SQLT_BDOUBLE);
+	CHECK_FALSE(Translate(Leaf(FilterOp::kGe, 15, {Double(INFINITY)})));
+	f = Translate(Leaf(FilterOp::kEq, 12, {Text("x")}));
+	REQUIRE(f);
+	CHECK(f->sql == "(\"NCH\" = :b1)");
 }

@@ -21,7 +21,8 @@ struct FilterConstant {
 	std::string text;         // kString
 };
 
-// kDateEq: CAST(col AS DATE) = d
+// kDateEq: CAST(col AS DATE) = d (the only form that maps to it). Under the plain operators a kDate constant
+// means "column compared with that DATE constant at midnight".
 enum class FilterOp { kAnd, kOr, kEq, kNe, kLt, kLe, kGt, kGe, kIn, kIsNull, kIsNotNull, kDateEq };
 
 struct FilterNode {

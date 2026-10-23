@@ -104,4 +104,9 @@ TEST_CASE("EncodeRowid matches Oracle", "[oracle][rowid]") {
 	CHECK(EncodeRowid(static_cast<uint32_t>(std::stoul(row[1])), 1024, static_cast<uint32_t>(std::stoul(row[2])),
 	                  static_cast<uint16_t>(std::stoul(row[3]))) == row[0]);
 	DropTableIfExists(session, "ITEST_ROWID");
+
+	// The bigfile split: the file field holds block >> 22 and the block field the low 22 bits
+	CHECK(Scalar(session, "SELECT DBMS_ROWID.ROWID_BLOCK_NUMBER(CHARTOROWID('" +
+	                          EncodeRowid(7, 1024, (5u << 22) | 9u, 0) + "'), 'BIGFILE') FROM dual") ==
+	      std::to_string((5u << 22) | 9u));
 }
