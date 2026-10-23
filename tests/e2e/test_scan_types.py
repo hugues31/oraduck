@@ -5,7 +5,7 @@ from decimal import Decimal
 import oracledb
 import pytest
 
-from oraduck_helpers import explain_scan, scan_call, scan_error, scan_json
+from oraduck_helpers import explain_scan, owner, scan_call, scan_error, scan_json
 
 UTC = "SET TimeZone = 'UTC';\n"
 
@@ -213,11 +213,11 @@ def test_projection_pushdown(table):
     table.execute(f"INSERT INTO {table.name} VALUES (1, 'b', SYSDATE)")
     table.conn.commit()
     (info,) = explain_scan(f"SELECT a FROM {scan_call(table.name)}", analyze=True)
-    assert info["Oracle SQL"].startswith(f'SELECT /* oraduck_scan */ "A" FROM "BENCH"."{table.name}"')
+    assert info["Oracle SQL"].startswith(f'SELECT /* oraduck_scan */ "A" FROM "{owner()}"."{table.name}"')
     assert '"B"' not in info["Oracle SQL"] and '"C"' not in info["Oracle SQL"]
     assert info["Columns"] == "A"
     (info,) = explain_scan(f"SELECT count(*) FROM {scan_call(table.name)}", analyze=True)
-    assert info["Oracle SQL"].startswith(f'SELECT /* oraduck_scan */ 1 FROM "BENCH"."{table.name}"')
+    assert info["Oracle SQL"].startswith(f'SELECT /* oraduck_scan */ 1 FROM "{owner()}"."{table.name}"')
     assert scan_json(f"SELECT a, count(*) AS n FROM {scan_call(table.name)} GROUP BY a") == [{"A": 1, "n": 1}]
 
 
@@ -225,20 +225,43 @@ def test_explain_shows_requested_options(table):
     table.create("A NUMBER(5)")
     options = "split := 'hash', snapshot := 'none'"
     (info,) = explain_scan(f"SELECT a FROM {scan_call(table.name, options)}")
-    assert info["Table"] == f"BENCH.{table.name}"
+    assert info["Table"] == f"{owner()}.{table.name}"
     assert info["Oracle WHERE"] == "—"
     assert (info["Split"], info["Snapshot"]) == ("hash", "none")
     (info,) = explain_scan(f"SELECT a FROM {scan_call(table.name)}")
     assert (info["Split"], info["Snapshot"]) == ("auto", "auto")
 
 
-@pytest.mark.parametrize("name", ["{t}", "bench.{t}", '"BENCH"."{t}"'])
-def test_table_name_forms(table, name):
+@pytest.mark.parametrize("form", ["table", "owner.table lower case", "quoted"])
+def test_table_name_forms(table, form):
     table.create("A NUMBER(5)")
     table.execute(f"INSERT INTO {table.name} VALUES (7)")
     table.conn.commit()
-    target = name.format(t=table.name.lower() if name.startswith("bench") else table.name)
+    target = {
+        "table": table.name,
+        "owner.table lower case": f"{owner()}.{table.name}".lower(),
+        "quoted": f'"{owner()}"."{table.name}"',
+    }[form]
     assert scan_json(f"SELECT a FROM oraduck_scan('{target}', connection := 'ora')") == [{"A": 7}]
+
+
+def test_invalid_utf8_names_the_column(table):
+    table.create("ID NUMBER(5), V VARCHAR2(20), CH CHAR(4), C CLOB, OK VARCHAR2(40)")
+    table.execute(f"INSERT INTO {table.name} (ID, OK) VALUES (1, 'é漢字😀')")
+    # The database (AL32UTF8) keeps the bytes of a relabelled RAW as they are: 'A', then C3 28 (invalid UTF-8)
+    bad = "UTL_RAW.CAST_TO_VARCHAR2(HEXTORAW('41C328'))"
+    table.execute(f"INSERT INTO {table.name} (ID, V, CH, C) VALUES (2, {bad}, {bad}, TO_CLOB({bad}))")
+    table.conn.commit()
+    assert table.rows("DUMP(V, 16)", order_by="ID")[1][0] == "Typ=1 Len=3: 41,c3,28"
+    # Valid multi-byte values still read
+    rows = scan_json(f"SELECT id, ok FROM {scan_call(table.name)} ORDER BY id")
+    assert rows == [{"ID": 1, "OK": "é漢字😀"}, {"ID": 2, "OK": None}]
+    for column in ["V", "CH"]:
+        err = scan_error(f"SELECT {column} FROM {scan_call(table.name)};")
+        assert f'column "{column}"' in err and "invalid UTF-8" in err, err
+    # A CLOB cannot hold them: Oracle replaces the invalid byte by U+FFFD when it stores the value
+    rows = scan_json(f"SELECT id, c FROM {scan_call(table.name)} ORDER BY id")
+    assert rows[0]["C"] is None and rows[1]["C"].startswith("A\ufffd")
 
 
 def test_nulls_across_chunks_and_batches(table):
@@ -251,9 +274,8 @@ def test_nulls_across_chunks_and_batches(table):
         "FROM dual CONNECT BY LEVEL <= 30000"
     )
     table.conn.commit()
-    expected = table.rows("COUNT(N), COUNT(S), COUNT(D), COUNT(X), COUNT(DBMS_LOB.GETLENGTH(C)), SUM(N), SUM(LENGTH(S)), "
-                          "SUM(X)",
-                          order_by="1")[0]
+    expected = table.rows("COUNT(N), COUNT(S), COUNT(D), COUNT(X), COUNT(DBMS_LOB.GETLENGTH(C)), SUM(N), "
+                          "SUM(LENGTH(S)), SUM(X)", order_by="1")[0]
     for options in ["split := 'none'", "split := 'hash', sessions := 3"]:
         rows = scan_json(
             "SELECT count(n) AS n, count(s) AS s, count(d) AS d, count(x) AS x, count(c) AS c, sum(n)::BIGINT AS sn, "

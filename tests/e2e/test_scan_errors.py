@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-from oraduck_helpers import (DUCKDB, WORKDIR, OracleTable, drop_view, env, fill_ids, scan_call, scan_error,
+from oraduck_helpers import (DUCKDB, WORKDIR, OracleTable, drop_view, env, fill_ids, owner, scan_call, scan_error,
                              secret_sql)
 
 ROWS_7M = 7_000_000
@@ -19,31 +19,32 @@ def client_sessions(oracle, pid: int) -> int:
         return cur.fetchone()[0]
 
 
-def run_and_watch_sessions(oracle, script: str, timeout: float = 300) -> tuple[str, int, int]:
+def run_and_watch_sessions(oracle, script: str, timeout: float = 300) -> tuple[str, int, int, float]:
     """Runs script in the CLI without -bail, followed by a marker file and a 3 s sleep. Returns the CLI output, the
-    most sessions seen while the script ran and the sessions left during the sleep."""
+    most sessions seen while the script ran, the sessions left during the sleep and the seconds until the marker."""
     WORKDIR.mkdir(parents=True, exist_ok=True)
     marker = WORKDIR / f"done_{uuid.uuid4().hex}"
     script += f".shell touch {marker}\n.shell sleep 3\n"
+    start = time.monotonic()
     proc = subprocess.Popen([str(DUCKDB), "-batch", "-no-agent", ":memory:"], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=WORKDIR)
     try:
         proc.stdin.write(script)
         proc.stdin.close()
         most = 0
-        deadline = time.monotonic() + timeout
         while not marker.exists():
             assert proc.poll() is None, "the CLI ended before the marker"
-            assert time.monotonic() < deadline, "timeout"
+            assert time.monotonic() - start < timeout, "timeout"
             most = max(most, client_sessions(oracle, proc.pid))
             time.sleep(0.05)
+        until_marker = time.monotonic() - start
         left = client_sessions(oracle, proc.pid)
         out, err = proc.communicate(timeout=60)
     finally:
         if proc.poll() is None:
             proc.kill()
         marker.unlink(missing_ok=True)
-    return out + err, most, left
+    return out + err, most, left, until_marker
 
 
 @pytest.fixture(scope="module")
@@ -62,7 +63,7 @@ def test_error_mid_scan_releases_sessions(oracle, million):
         cur.execute(f"CREATE VIEW {view} AS SELECT ID, 1 / CASE WHEN ID = 50000 THEN 0 ELSE 1 END AS X "
                     f"FROM {million.name}")
     try:
-        output, _, left = run_and_watch_sessions(
+        output, _, left, _ = run_and_watch_sessions(
             oracle, secret_sql() + "SET threads = 8;\n" + f"SELECT sum(x) FROM {scan_call(view)};\n")
         assert "ORA-01476" in output, output
         assert "OraDuck" in output
@@ -78,14 +79,15 @@ def test_interrupt_releases_sessions(oracle, seven_million):
     with oracle.cursor() as cur:
         cur.execute(f"CREATE VIEW {view} AS SELECT ID, RPAD(TO_CHAR(ID), 1000, 'x') AS PAD FROM {seven_million.name}")
     try:
-        start = time.monotonic()
-        output, most, left = run_and_watch_sessions(
+        output, most, left, until_marker = run_and_watch_sessions(
             oracle,
             secret_sql() + "SET threads = 8;\nSET max_execution_time = 1000;\n"
             f"SELECT sum(length(pad)) FROM {scan_call(view)};\n",
         )
         assert "maximum execution time" in output, output
-        assert time.monotonic() - start < 10, "the scan was not stopped promptly"
+        # Uninterrupted, the read takes about 20 s; the bound leaves room for the CLI start, the bind and the planning
+        # on a loaded machine, and the 3 s sleep comes after the marker
+        assert until_marker < 15, f"the scan was not stopped promptly ({until_marker:.1f} s)"
         assert most >= 2, "the sessions of the scan were never seen in V$SESSION"
         assert left == 0
     finally:
@@ -108,7 +110,7 @@ def test_bind_errors(oracle, table):
     err = scan_error(f"SELECT * FROM {bigint};")
     assert "BIGINT" in err and "DECIMAL(p,s)" in err
     # READER may read neither DBMS_FLASHBACK nor V$DATABASE: no common snapshot, an error under 'scn'
-    scn = scan_call("BENCH." + table.name, "snapshot := 'scn'")
+    scn = scan_call(f"{owner()}.{table.name}", "snapshot := 'scn'")
     err = scan_error(f"SELECT * FROM {scn};", reader=True)
     assert "snapshot 'scn'" in err and "DBMS_FLASHBACK" in err, err
 

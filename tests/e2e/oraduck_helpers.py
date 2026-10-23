@@ -22,8 +22,13 @@ def env(name: str) -> str:
     return value
 
 
+def owner() -> str:
+    """Schema of the configured Oracle user (ORADUCK_ORACLE_USER), which owns the test tables."""
+    return env("ORADUCK_ORACLE_USER").upper()
+
+
 def secret_sql(name: str = "ora", reader: bool = False) -> str:
-    """CREATE SECRET for the BENCH user, or for the READER user (CREATE SESSION only) when reader is set."""
+    """CREATE SECRET for the test user, or for the READER user (CREATE SESSION only) when reader is set."""
     prefix = "ORADUCK_ORACLE_READER" if reader else "ORADUCK_ORACLE"
     return (
         f"CREATE SECRET {name} (TYPE oraduck, USER '{env(prefix + '_USER')}', "

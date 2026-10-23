@@ -6,8 +6,8 @@ import textwrap
 import pytest
 
 from conftest import MILLION
-from oraduck_helpers import (drop_view, env, explain_scan, fill_ids, json_documents, run_duckdb, scan_call, scan_json,
-                             scan_output, secret_sql, split_warnings)
+from oraduck_helpers import (drop_view, env, explain_scan, fill_ids, json_documents, owner, run_duckdb, scan_call,
+                             scan_json, scan_output, secret_sql, split_warnings)
 
 THREADS = "SET threads = 8;\n"
 SUM = MILLION * (MILLION + 1) // 2
@@ -35,7 +35,7 @@ def test_split_strategies_agree(million, split):
         assert units == 8 and int(info["Sessions"]) == 8
     else:
         assert units == 1 and int(info["Sessions"]) == 1
-    # BENCH may run DBMS_FLASHBACK: one snapshot SCN for every session
+    # The test user may run DBMS_FLASHBACK: one snapshot SCN for every session
     assert info["Snapshot"].isdigit(), info
     assert f'AS OF SCN TO_NUMBER(\'{info["Snapshot"]}\')' in info["Oracle SQL"]
     assert float(info["Planning (ms)"]) >= 0
@@ -58,7 +58,7 @@ def test_reader_uses_parallel_execute_chunks(million, oracle):
         cur.execute(f"CREATE VIEW {view} AS SELECT ID, PAD FROM {million.name}")
         cur.execute(f"GRANT SELECT ON {view} TO {env('ORADUCK_ORACLE_READER_USER')}")
     try:
-        call = scan_call(f"BENCH.{million.name}")
+        call = scan_call(f"{owner()}.{million.name}")
         (info,) = explain_scan(f"SELECT sum(id) FROM {call}", setup=THREADS, analyze=True, reader=True)
         assert info["Strategy"] == "extents"
         assert "DBMS_PARALLEL_EXECUTE" in info["Notes"]
@@ -68,10 +68,10 @@ def test_reader_uses_parallel_execute_chunks(million, oracle):
         rows = scan_json(f"SELECT count(*) AS n, sum(id)::BIGINT AS s FROM {call}", setup=THREADS, reader=True)
         assert rows == [{"n": MILLION, "s": SUM}]
 
-        (info,) = explain_scan(f"SELECT sum(id) FROM {scan_call('BENCH.' + view)}", setup=THREADS, analyze=True,
+        (info,) = explain_scan(f"SELECT sum(id) FROM {scan_call(f'{owner()}.{view}')}", setup=THREADS, analyze=True,
                                reader=True)
         assert info["Strategy"] == "hash"
-        rows = scan_json(f"SELECT count(*) AS n, sum(id)::BIGINT AS s FROM {scan_call('BENCH.' + view)}",
+        rows = scan_json(f"SELECT count(*) AS n, sum(id)::BIGINT AS s FROM {scan_call(f'{owner()}.{view}')}",
                          setup=THREADS, reader=True)
         assert rows == [{"n": MILLION, "s": SUM}]
 

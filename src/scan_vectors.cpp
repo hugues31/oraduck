@@ -3,6 +3,7 @@
 #include "duckdb/common/types/cast_helpers.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "utf8proc_wrapper.hpp"
 
 // OraDuck (OCI) headers after DuckDB
 #include "oraduck/errors.hpp"
@@ -145,10 +146,26 @@ void WriteNative(const FetchCursor &cursor, size_t column, const ReadColumnPlan 
 	});
 }
 
-// Strings (UTF-8) and binary values: copied once, into the vector's string heap
+// Binary values: copied once, into the vector's string heap
 void WriteBytes(const FetchCursor &cursor, size_t column, uint32_t first, uint32_t count, Vector &out, idx_t offset) {
 	WriteValues<string_t>(cursor, column, first, count, out, offset, [](const uint8_t *value, uint32_t length) {
 		return string_t(const_char_ptr_cast(value), length);
+	});
+}
+
+// Character values, converted to UTF-8 by OCI: a database in the same character set hands its bytes over as they are,
+// so bytes stored invalid in Oracle are rejected here (a DuckDB VARCHAR must be valid UTF-8). Analyze checks 8 or 32
+// ASCII bytes at a time and allocates nothing.
+void WriteStrings(const FetchCursor &cursor, size_t column, const ReadColumnPlan &plan, uint32_t first, uint32_t count,
+                  Vector &out, idx_t offset) {
+	WriteValues<string_t>(cursor, column, first, count, out, offset, [&](const uint8_t *value, uint32_t length) {
+		const auto text = const_char_ptr_cast(value);
+		size_t position = 0;
+		if (Utf8Proc::Analyze(text, length, nullptr, &position) == UnicodeType::INVALID) {
+			ThrowValueError(plan, "invalid UTF-8 at byte " + std::to_string(position + 1) + " of a value of " +
+			                          std::to_string(length) + " bytes");
+		}
+		return string_t(text, length);
 	});
 }
 
@@ -237,6 +254,7 @@ void WriteDecoded(const FetchCursor &cursor, size_t c, const ReadColumnPlan &pla
 	case FetchDecoder::kNativeFloat:
 		return WriteNative<float>(cursor, c, plan, first_row, count, out, out_offset);
 	case FetchDecoder::kString:
+		return WriteStrings(cursor, c, plan, first_row, count, out, out_offset);
 	case FetchDecoder::kBinary:
 		return WriteBytes(cursor, c, first_row, count, out, out_offset);
 	case FetchDecoder::kDate:
