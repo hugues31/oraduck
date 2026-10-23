@@ -29,6 +29,8 @@ struct OracleColumn {
 	int32_t precision = -1;   // -1 when NULL
 	int32_t scale = -1;       // -1 when NULL
 	bool nullable = true;
+	uint32_t char_length = 0; // ALL_TAB_COLUMNS.CHAR_LENGTH (read path)
+	bool national = false;    // CHARACTER_SET_NAME = 'NCHAR_CS' (read path)
 };
 
 struct TableDescription {

@@ -19,6 +19,7 @@ set(EXTENSION_SOURCES
     src/oracle_encoding.cpp
     src/oracle_decoding.cpp
     src/oracle_names.cpp
+    src/read_types.cpp
     src/oci_api.cpp
     src/oci.cpp
     src/oci_session.cpp
