@@ -261,7 +261,7 @@ not offered: it gives up the parallel sessions, and a unique index still ends
   with the extension** (`build/release/duckdb`). The Python `duckdb` package is
   not used: loading a locally built C++ extension into a Python wheel risks C++
   ABI mismatches. The extension built by the CI (manylinux toolchain, like
-  DuckDB's) loads in the Python package (checked with duckdb 1.5.5 from PyPI).
+  DuckDB's) loads in the Python package (checked with duckdb 2.0.0 from PyPI).
 - OCI is loaded at run time (`OciApi`): the build needs no Oracle software, and
   the extension loads without Instant Client; the first function that talks to
   Oracle loads `libclntsh.so` (Linux: `LD_LIBRARY_PATH`), `oci.dll` (Windows:
