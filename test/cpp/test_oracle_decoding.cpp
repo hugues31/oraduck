@@ -2,6 +2,8 @@
 #include "oraduck/oracle_decoding.hpp"
 #include "oraduck/oracle_encoding.hpp"
 
+#include "oraduck/errors.hpp"
+
 #include <string>
 #include <vector>
 
@@ -182,6 +184,79 @@ TEST_CASE("NUMBER at the 128-bit limits", "[decoding]") {
 	CHECK(DecodeOracleNumberScaled64(huge, 2, 0, false, v) == NumberDecodeStatus::kOverflow);
 }
 
+TEST_CASE("NUMBER rounding carries and branches", "[decoding]") {
+	uint8_t buf[kOracleNumberMaxBytes];
+	int64_t v = 0;
+	OracleInt128 w {0, 0};
+	// 9.95 at scale 1 rounds up with a carry through every digit: 100
+	size_t n = EncodeOracleNumber(static_cast<uint64_t>(995), false, 2, buf);
+	CHECK(DecodeOracleNumberScaled64(buf, n, 1, true, v) == NumberDecodeStatus::kOk);
+	CHECK(v == 100);
+	CHECK(DecodeOracleNumberScaled128(buf, n, 1, true, w) == NumberDecodeStatus::kOk);
+	CHECK(w.lo == 100);
+	CHECK(w.hi == 0);
+	n = EncodeOracleNumber(static_cast<uint64_t>(995), true, 2, buf);
+	CHECK(DecodeOracleNumberScaled64(buf, n, 1, true, v) == NumberDecodeStatus::kOk);
+	CHECK(v == -100);
+	// 0.004 at scale 1 (keep < 0): 0 with rounding, inexact without
+	n = EncodeOracleNumber(static_cast<uint64_t>(4), false, 3, buf);
+	CHECK(DecodeOracleNumberScaled64(buf, n, 1, true, v) == NumberDecodeStatus::kOk);
+	CHECK(v == 0);
+	CHECK(DecodeOracleNumberScaled64(buf, n, 1, false, v) == NumberDecodeStatus::kInexact);
+	// 0.006 at scale 1 is still below 0.05: keep < 0 never rounds up
+	n = EncodeOracleNumber(static_cast<uint64_t>(6), false, 3, buf);
+	CHECK(DecodeOracleNumberScaled64(buf, n, 1, true, v) == NumberDecodeStatus::kOk);
+	CHECK(v == 0);
+	// Scaled128 with rounding: 30 digits, the last 3 are fractional (123456789012345678901234567.895)
+	const std::string digits30 = "123456789012345678901234567895";
+	n = EncodeOracleNumber(ParseMagnitude(digits30), false, 3, buf);
+	REQUIRE(n > 0);
+	CHECK(DecodeOracleNumberScaled128(buf, n, 2, true, w) == NumberDecodeStatus::kOk);
+	OracleInt128 expected = Signed(ParseMagnitude("12345678901234567890123456790"), false);
+	CHECK(w.lo == expected.lo);
+	CHECK(w.hi == expected.hi);
+	n = EncodeOracleNumber(ParseMagnitude(digits30), true, 3, buf);
+	CHECK(DecodeOracleNumberScaled128(buf, n, 2, true, w) == NumberDecodeStatus::kOk);
+	expected = Signed(ParseMagnitude("12345678901234567890123456790"), true);
+	CHECK(w.lo == expected.lo);
+	CHECK(w.hi == expected.hi);
+	CHECK(DecodeOracleNumberScaled128(buf, n, 2, false, w) == NumberDecodeStatus::kInexact);
+	// Precedence: 30 digits with fractional digits at scale 0, no rounding, 64-bit: inexact (not overflow)
+	n = EncodeOracleNumber(ParseMagnitude(digits30), false, 3, buf);
+	CHECK(DecodeOracleNumberScaled64(buf, n, 0, false, v) == NumberDecodeStatus::kInexact);
+	// With rounding the integer part exceeds int64: overflow
+	CHECK(DecodeOracleNumberScaled64(buf, n, 0, true, v) == NumberDecodeStatus::kOverflow);
+}
+
+TEST_CASE("NUMBER malformed input", "[decoding]") {
+	int64_t v = 0;
+	OracleInt128 w {0, 0};
+	const uint8_t too_long[23] = {0xC1, 0x02};
+	CHECK_THROWS_AS(DecodeOracleNumberScaled64(too_long, 23, 0, false, v), OraduckError);
+	CHECK_THROWS_AS(DecodeOracleNumberText(too_long, 23), OraduckError);
+	const uint8_t digit_low[] = {0xC1, 0x00};   // positive digit byte 0 is below the +1 offset
+	const uint8_t digit_high[] = {0xC1, 102};   // digit 101
+	const uint8_t neg_low[] = {0x3E, 0x65, 0x66}; // negative digit 101 - 101 = 0 is fine, 0x66 ends it
+	const uint8_t neg_bad[] = {0x3E, 0x00, 0x66}; // negative digit 101
+	CHECK_THROWS_AS(DecodeOracleNumberScaled64(digit_low, 2, 0, false, v), OraduckError);
+	CHECK_THROWS_AS(DecodeOracleNumberScaled128(digit_high, 2, 0, false, w), OraduckError);
+	CHECK_THROWS_AS(DecodeOracleNumberText(digit_high, 2), OraduckError);
+	CHECK_THROWS_AS(DecodeOracleNumberScaled64(neg_bad, 3, 0, false, v), OraduckError);
+	CHECK_NOTHROW(DecodeOracleNumberScaled64(neg_low, 3, 0, false, v));
+	// A negative number made of the 0x66 terminator only has no mantissa
+	const uint8_t only_terminator[] = {0x3E, 0x66};
+	CHECK_THROWS_AS(DecodeOracleNumberScaled64(only_terminator, 2, 0, false, v), OraduckError);
+	CHECK_THROWS_AS(DecodeOracleNumberText(only_terminator, 2), OraduckError);
+	// Zero is the single byte 0x80
+	const uint8_t zero_digits[] = {0x80, 0x02};
+	CHECK_THROWS_AS(DecodeOracleNumberScaled64(zero_digits, 2, 0, false, v), OraduckError);
+	CHECK_THROWS_AS(DecodeOracleNumberScaled128(zero_digits, 2, 0, false, w), OraduckError);
+	CHECK_THROWS_AS(DecodeOracleNumberText(zero_digits, 2), OraduckError);
+	// Positive number without mantissa
+	const uint8_t no_mantissa[] = {0xC1};
+	CHECK_THROWS_AS(DecodeOracleNumberText(no_mantissa, 1), OraduckError);
+}
+
 TEST_CASE("DATE and TIMESTAMP", "[decoding]") {
 	const uint8_t d[] = {120, 124, 5, 7, 11, 21, 31}; // 2024-05-07 10:20:30
 	int64_t micros = 0;
@@ -235,4 +310,11 @@ TEST_CASE("DATE and TIMESTAMP", "[decoding]") {
 	CHECK(DecodeOracleTimestamp(ts, 7, micros));
 	CHECK(micros == 1715077230000000LL);
 	CHECK_FALSE(DecodeOracleTimestamp(ts, 8, micros));
+	// Nanoseconds out of range
+	const uint32_t bad_nanos = 1000000000u;
+	ts[7] = static_cast<uint8_t>(bad_nanos >> 24);
+	ts[8] = static_cast<uint8_t>(bad_nanos >> 16);
+	ts[9] = static_cast<uint8_t>(bad_nanos >> 8);
+	ts[10] = static_cast<uint8_t>(bad_nanos);
+	CHECK_FALSE(DecodeOracleTimestamp(ts, 11, micros));
 }

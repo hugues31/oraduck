@@ -11,7 +11,7 @@ OVERRIDE_GIT_DESCRIBE ?= $(shell git -C $(PROJ_DIR)duckdb describe --tags --exac
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # --- OraDuck targets outside the DuckDB build: C++ tests and probes (itest and probes: source env.sh) ---
-.PHONY: unit itest probe read-probe
+.PHONY: unit itest probe read-probe decode-bench
 
 ORADUCK_CXX ?= g++
 ORADUCK_CXXFLAGS := -std=c++17 -O2 -g -Wall -Wextra -I$(PROJ_DIR)src/include
@@ -51,3 +51,10 @@ build/probe/oraduck_read_probe: tools/read_probe.cpp $(PURE_SRCS) $(OCI_SRCS) $(
 
 read-probe: build/probe/oraduck_read_probe
 	./build/probe/oraduck_read_probe $(READ_PROBE_ARGS)
+
+build/probe/oraduck_decode_bench: tools/decode_bench.cpp $(PURE_SRCS) $(ORADUCK_HEADERS)
+	@mkdir -p $(dir $@)
+	$(ORADUCK_CXX) $(ORADUCK_CXXFLAGS) tools/decode_bench.cpp $(PURE_SRCS) -ldl -o $@
+
+decode-bench: build/probe/oraduck_decode_bench
+	taskset -c 0-7 ./build/probe/oraduck_decode_bench

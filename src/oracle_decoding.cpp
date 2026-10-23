@@ -7,65 +7,144 @@ namespace oraduck {
 
 namespace {
 
-// A NUMBER as decimal digits: value = 0.DIGITS * 10^point (point = digits before the decimal point,
-// negative or zero for leading fractional zeros). digits has no leading or trailing zero; empty = zero.
-struct DecodedNumber {
+constexpr uint64_t kPow10[19] = {1ULL,
+                                 10ULL,
+                                 100ULL,
+                                 1000ULL,
+                                 10000ULL,
+                                 100000ULL,
+                                 1000000ULL,
+                                 10000000ULL,
+                                 100000000ULL,
+                                 1000000000ULL,
+                                 10000000000ULL,
+                                 100000000000ULL,
+                                 1000000000000ULL,
+                                 10000000000000ULL,
+                                 100000000000000ULL,
+                                 1000000000000000ULL,
+                                 10000000000000000ULL,
+                                 100000000000000000ULL,
+                                 1000000000000000000ULL};
+// A NUMBER parsed in place, without allocation. The mantissa is kept as base-100 digits ("pairs"); the
+// decimal digit stream is the pairs read as two digits each. value = 0.DIGITS * 10^point, where DIGITS
+// are stream digits [lead, lead + size): no leading and no trailing zero digit. zero: size == 0.
+struct ParsedNumber {
 	bool negative = false;
 	bool infinity = false;
-	std::string digits;
+	bool zero = false;
 	int point = 0;
+	int lead = 0;
+	int size = 0;
+	uint8_t pairs[20];
+
+	// i-th digit of the stream
+	uint32_t StreamDigit(int i) const {
+		const uint32_t pair = pairs[i >> 1];
+		return (i & 1) ? pair % 10 : pair / 10;
+	}
+	// Value of the stream digits [pos, pos + digits), digits <= 18. Whole pairs are combined in
+	// independent groups so that the multiplications do not form one long dependency chain.
+	uint64_t ChunkValue(int pos, int digits) const {
+		const int end = pos + digits;
+		uint64_t value = 0;
+		if (pos & 1) {
+			value = pairs[pos >> 1] % 10;
+			pos++;
+		}
+		const uint8_t *p = pairs + (pos >> 1);
+		int count = (end - pos) >> 1;
+		pos += 2 * count;
+		uint64_t whole = 0;
+		const int whole_pairs = count;
+		while (count >= 4) {
+			const uint64_t group = (static_cast<uint64_t>(p[0]) * 100 + p[1]) * 10000 + (p[2] * 100 + p[3]);
+			whole = whole * 100000000ULL + group;
+			p += 4;
+			count -= 4;
+		}
+		for (; count > 0; count--) {
+			whole = whole * 100 + *p++;
+		}
+		value = value * kPow10[2 * whole_pairs] + whole;
+		if (pos < end) {
+			value = value * 10 + pairs[pos >> 1] / 10;
+		}
+		return value;
+	}
+	// i-th significant digit
+	uint32_t Digit(int i) const {
+		return StreamDigit(lead + i);
+	}
 };
 
-DecodedNumber ParseNumber(const uint8_t *bytes, size_t len) {
-	DecodedNumber r;
+void ParseNumber(const uint8_t *bytes, size_t len, ParsedNumber &r) {
 	if (len == 0 || len > kOracleNumberMaxBytes) {
 		throw OraduckError("malformed Oracle NUMBER (length " + std::to_string(len) + ")");
 	}
-	if (len == 1 && bytes[0] == 0x80) {
-		return r;
+	if (bytes[0] == 0x80) {
+		if (len != 1) {
+			throw OraduckError("malformed Oracle NUMBER (zero with digits)");
+		}
+		r.zero = true;
+		return;
 	}
 	if (len == 1 && bytes[0] == 0x00) {
 		r.negative = r.infinity = true;
-		return r;
+		return;
 	}
 	if (len == 2 && bytes[0] == 0xFF && bytes[1] == 0x65) {
 		r.infinity = true;
-		return r;
+		return;
 	}
 	r.negative = bytes[0] < 0x80;
 	const int exponent = r.negative ? 0x3E - bytes[0] : bytes[0] - 0xC1;
-	size_t count = len - 1;
+	int count = static_cast<int>(len) - 1;
 	if (r.negative && count > 0 && bytes[len - 1] == 102) {
 		count--; // terminator of a negative mantissa shorter than 20 digits
 	}
 	if (count == 0 || count > 20) {
 		throw OraduckError("malformed Oracle NUMBER (mantissa)");
 	}
-	std::string digits;
-	for (size_t i = 0; i < count; i++) {
-		const int d = r.negative ? 101 - bytes[1 + i] : bytes[1 + i] - 1;
-		if (d < 0 || d > 99) {
-			throw OraduckError("malformed Oracle NUMBER (digit)");
-		}
-		digits += static_cast<char>('0' + d / 10);
-		digits += static_cast<char>('0' + d % 10);
+	// Digit: b - 1 (positive) or 101 - b (negative), branch free on the sign; out of 0..99 is malformed
+	const unsigned offset = r.negative ? 102u : 1u;
+	const unsigned flip = r.negative ? 0xFFu : 0u; // 101 - b == ~(b - 102) over 8 bits
+	unsigned bad = 0;
+	for (int i = 0; i < count; i++) {
+		const unsigned d = ((bytes[1 + i] - offset) ^ flip) & 0xFFu;
+		bad |= d > 99 ? 1u : 0u;
+		r.pairs[i] = static_cast<uint8_t>(d);
 	}
-	int point = 2 * (exponent + 1);
-	size_t first = 0;
-	while (first < digits.size() && digits[first] == '0') {
+	if (bad) {
+		throw OraduckError("malformed Oracle NUMBER (digit)");
+	}
+	int first = 0;
+	while (first < count && r.pairs[first] == 0) {
 		first++;
-		point--;
 	}
-	size_t last = digits.size();
-	while (last > first && digits[last - 1] == '0') {
-		last--;
-	}
-	r.digits = digits.substr(first, last - first);
-	r.point = point;
-	if (r.digits.empty()) {
+	if (first == count) { // all digits are zero
+		r.zero = true;
 		r.negative = false;
+		return;
 	}
-	return r;
+	while (r.pairs[count - 1] == 0) {
+		count--;
+	}
+	r.lead = 2 * first + (r.pairs[first] < 10 ? 1 : 0);
+	r.size = 2 * count - (r.pairs[count - 1] % 10 == 0 ? 1 : 0) - r.lead;
+	r.point = 2 * (exponent + 1) - r.lead;
+}
+
+constexpr int kChunkDigits = 18; // a chunk of up to 18 digits fits a uint64_t
+
+// 64 x 64 -> 128 bits, portable
+void Mul64(uint64_t a, uint64_t b, uint64_t &hi, uint64_t &lo) {
+	const uint64_t mask = 0xFFFFFFFFULL;
+	const uint64_t a0 = a & mask, a1 = a >> 32, b0 = b & mask, b1 = b >> 32;
+	const uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+	const uint64_t mid = (p00 >> 32) + (p01 & mask) + (p10 & mask);
+	hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+	lo = (mid << 32) | (p00 & mask);
 }
 
 // Unsigned 128-bit accumulator (portable: MSVC has no __int128).
@@ -73,16 +152,38 @@ struct Acc {
 	uint64_t hi = 0;
 	uint64_t lo = 0;
 
-	// this = this * 10 + digit; false on overflow of 128 bits
-	bool MulAdd10(uint32_t digit) {
-		const uint64_t low = (lo & 0xFFFFFFFFULL) * 10 + digit;
-		const uint64_t high = (lo >> 32) * 10 + (low >> 32);
-		const uint64_t carry = high >> 32;
-		if (hi > (UINT64_MAX - carry) / 10) {
+	// this = this * multiplier + addend; false on overflow of 128 bits
+	bool MulAdd(uint64_t multiplier, uint64_t addend) {
+		if (hi == 0) {
+			if (lo == 0) {
+				lo = addend;
+				return true;
+			}
+			uint64_t p_hi, p_lo;
+			Mul64(lo, multiplier, p_hi, p_lo);
+			hi = p_hi;
+			lo = p_lo + addend;
+			if (lo < addend && ++hi == 0) {
+				return false;
+			}
+			return true;
+		}
+		uint64_t h_hi, h_lo, p_hi, p_lo;
+		Mul64(hi, multiplier, h_hi, h_lo);
+		if (h_hi != 0) {
 			return false;
 		}
-		hi = hi * 10 + carry;
-		lo = (high << 32) | (low & 0xFFFFFFFFULL);
+		Mul64(lo, multiplier, p_hi, p_lo);
+		const uint64_t new_hi = h_lo + p_hi;
+		if (new_hi < h_lo) {
+			return false;
+		}
+		const uint64_t new_lo = p_lo + addend;
+		if (new_lo < addend && new_hi + 1 == 0) {
+			return false;
+		}
+		hi = new_hi + (new_lo < addend ? 1 : 0);
+		lo = new_lo;
 		return true;
 	}
 	bool Increment() {
@@ -95,32 +196,44 @@ struct Acc {
 	}
 };
 
-// value * 10^scale as an unsigned magnitude with the given bit capacity (64 or 128).
-NumberDecodeStatus ScaledMagnitude(const DecodedNumber &n, uint8_t scale, bool round, Acc &acc) {
+// value * 10^scale as an unsigned 128-bit magnitude (the caller applies the sign and its own range).
+NumberDecodeStatus ScaledMagnitude(const ParsedNumber &n, uint8_t scale, bool round, Acc &acc) {
 	if (n.infinity) {
 		return NumberDecodeStatus::kInfinity;
 	}
-	if (n.digits.empty()) {
+	if (n.zero) {
 		return NumberDecodeStatus::kOk;
 	}
 	const int keep = n.point + scale; // digits kept, the rest is the fractional remainder
 	if (keep > 40) {
 		return NumberDecodeStatus::kOverflow;
 	}
-	const int size = static_cast<int>(n.digits.size());
-	for (int i = 0; i < keep; i++) {
-		if (!acc.MulAdd10(i < size ? static_cast<uint32_t>(n.digits[i] - '0') : 0)) {
+	// Digits [lead, lead + taken) of the stream go into the accumulator, base 100 where aligned
+	const int taken = keep < n.size ? (keep > 0 ? keep : 0) : n.size;
+	// In chunks of up to 18 digits, each one a uint64_t
+	for (int pos = n.lead, end = n.lead + taken; pos < end;) {
+		const int digits = end - pos < kChunkDigits ? end - pos : kChunkDigits;
+		if (!acc.MulAdd(kPow10[digits], n.ChunkValue(pos, digits))) {
 			return NumberDecodeStatus::kOverflow;
 		}
+		pos += digits;
 	}
-	if (keep >= size) {
+	// Trailing zeros of the integer part
+	for (int pad = keep - taken; pad > 0;) {
+		const int step = pad < kChunkDigits ? pad : kChunkDigits;
+		if (!acc.MulAdd(kPow10[step], 0)) {
+			return NumberDecodeStatus::kOverflow;
+		}
+		pad -= step;
+	}
+	if (keep >= n.size) {
 		return NumberDecodeStatus::kOk;
 	}
 	// Digits remain (the last digit is non zero, so the remainder is non zero)
 	if (!round) {
 		return NumberDecodeStatus::kInexact;
 	}
-	const bool up = keep >= 0 ? n.digits[keep] >= '5' : false; // keep < 0: value below 0.1 unit
+	const bool up = keep >= 0 ? n.Digit(keep) >= 5 : false; // keep < 0: value below 0.1 unit
 	if (up && !acc.Increment()) {
 		return NumberDecodeStatus::kOverflow;
 	}
@@ -131,7 +244,8 @@ NumberDecodeStatus ScaledMagnitude(const DecodedNumber &n, uint8_t scale, bool r
 
 NumberDecodeStatus DecodeOracleNumberScaled64(const uint8_t *bytes, size_t len, uint8_t scale, bool round,
                                               int64_t &out) {
-	const DecodedNumber n = ParseNumber(bytes, len);
+	ParsedNumber n;
+	ParseNumber(bytes, len, n);
 	Acc acc;
 	const auto status = ScaledMagnitude(n, scale, round, acc);
 	if (status != NumberDecodeStatus::kOk) {
@@ -147,7 +261,8 @@ NumberDecodeStatus DecodeOracleNumberScaled64(const uint8_t *bytes, size_t len, 
 
 NumberDecodeStatus DecodeOracleNumberScaled128(const uint8_t *bytes, size_t len, uint8_t scale, bool round,
                                                OracleInt128 &out) {
-	const DecodedNumber n = ParseNumber(bytes, len);
+	ParsedNumber n;
+	ParseNumber(bytes, len, n);
 	Acc acc;
 	const auto status = ScaledMagnitude(n, scale, round, acc);
 	if (status != NumberDecodeStatus::kOk) {
@@ -168,26 +283,35 @@ NumberDecodeStatus DecodeOracleNumberScaled128(const uint8_t *bytes, size_t len,
 }
 
 std::string DecodeOracleNumberText(const uint8_t *bytes, size_t len) {
-	const DecodedNumber n = ParseNumber(bytes, len);
+	ParsedNumber n;
+	ParseNumber(bytes, len, n);
 	if (n.infinity) {
 		return n.negative ? "-Infinity" : "Infinity";
 	}
-	if (n.digits.empty()) {
+	if (n.zero) {
 		return "0";
 	}
-	std::string text = n.negative ? "-" : "";
-	const int size = static_cast<int>(n.digits.size());
+	std::string text;
+	text.reserve(static_cast<size_t>(n.size) + (n.point < 0 ? static_cast<size_t>(-n.point) : 0) + 4);
+	if (n.negative) {
+		text += '-';
+	}
+	auto append_digits = [&](int from, int to) {
+		for (int i = from; i < to; i++) {
+			text += static_cast<char>('0' + n.Digit(i));
+		}
+	};
 	if (n.point <= 0) {
 		text += "0.";
 		text.append(static_cast<size_t>(-n.point), '0');
-		text += n.digits;
-	} else if (n.point >= size) {
-		text += n.digits;
-		text.append(static_cast<size_t>(n.point - size), '0');
+		append_digits(0, n.size);
+	} else if (n.point >= n.size) {
+		append_digits(0, n.size);
+		text.append(static_cast<size_t>(n.point - n.size), '0');
 	} else {
-		text += n.digits.substr(0, static_cast<size_t>(n.point));
+		append_digits(0, n.point);
 		text += '.';
-		text += n.digits.substr(static_cast<size_t>(n.point));
+		append_digits(n.point, n.size);
 	}
 	return text;
 }
