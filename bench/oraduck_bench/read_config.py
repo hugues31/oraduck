@@ -15,3 +15,11 @@ READ_OUT_DB = WORK / "read_out.duckdb"
 READ_THREADS = 8
 READ_SUITE = "read"
 CLOB_FILL_PERCENT = 2
+
+# (method, DuckDB threads): OraDuck at N = 8 and N = 1, then the six other ways to fill a DuckDB table
+READ_COMPETITOR_SERIES = (
+    ("oraduck", 8), ("oraduck", 1), ("quack_oracle", 8), ("rinie_oracle", 8), ("oracledb_thin", 8),
+    ("oracledb_thick", 8), ("connectorx", 8), ("sqlplus_csv", 8),
+)
+PYTHON_BATCH_SIZE = 100_000
+SQLPLUS_ARRAYSIZE = 5000

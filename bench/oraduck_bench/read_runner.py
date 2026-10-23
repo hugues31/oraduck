@@ -34,6 +34,11 @@ def duck_checksums() -> read_schema.ReadChecksums:
     return read_schema.ReadChecksums(*(int(v) for v in row))
 
 
+def duck_checksums_cast() -> read_schema.ReadChecksums:
+    row = duck.query(read_schema.READ_CHECKSUM_DUCK_CAST.format(table="t"), READ_OUT_DB)[0]
+    return read_schema.ReadChecksums(*(int(v) for v in row))
+
+
 def run_read_case(
     cfg: OracleConfig,
     nrows: int,
@@ -49,6 +54,7 @@ def run_read_case(
     ensure: Callable = read_data.ensure_read_table,
     run_method: Callable = read_methods.run,
     duck_checksums: Callable = duck_checksums,
+    duck_checksums_cast: Callable = duck_checksums_cast,
     oracle_checksums: Callable = oracle_checksums,
 ) -> list[dict]:
     """One warm-up round (unless warmup is false) then `runs` interleaved rounds of `methods`. A method that
@@ -83,15 +89,43 @@ def run_read_case(
                                                  "warmup": is_warmup, "limit_s": timeout_s, "at": at}))
                     print(f"{READ_SUITE} {table} {method} N={threads}: stopped after {timeout_s} s", flush=True)
                     continue
-                got = duck_checksums()  # not timed
+                except duck.DuckDBError as exc:  # a competitor that cannot do the case; OraDuck failing is a bug
+                    if method.startswith("oraduck"):
+                        raise
+                    active.remove(method)
+                    records.append(_append(out, {"type": "error", **case, "method": method, "threads": threads,
+                                                 "warmup": is_warmup, "message": str(exc)[:2000], "at": at}))
+                    print(f"{READ_SUITE} {table} {method} N={threads}: failed: {str(exc)[:300]}", flush=True)
+                    continue
+                if m.extra.get("skipped"):
+                    active.remove(method)
+                    records.append(_append(out, {"type": "skipped", **case, "method": method, "threads": threads,
+                                                 "reason": m.extra["skipped"], "at": at}))
+                    print(f"{READ_SUITE} {table} {method} N={threads}: skipped ({m.extra['skipped']})", flush=True)
+                    continue
+                cast = False
+                try:
+                    got = duck_checksums()  # not timed
+                except (duck.DuckDBError, ValueError):  # no sum on text, or a float sum
+                    if method.startswith("oraduck"):
+                        raise
+                    got, cast = duck_checksums_cast(), True  # the method loaded a column as another type
                 if got != expected:
-                    raise ChecksumMismatch(f"{method} N={threads} {table} run {round_index}: expected {expected}, "
-                                           f"got {got}")
+                    message = (f"{method} N={threads} {table} run {round_index}: expected {expected}, got {got}")
+                    if method.startswith("oraduck"):
+                        raise ChecksumMismatch(message)
+                    # a competitor that loads other data is reported as such, not timed
+                    active.remove(method)
+                    records.append(_append(out, {"type": "mismatch", **case, "method": method, "threads": threads,
+                                                 "warmup": is_warmup, "message": message, "total_s": m.total_s,
+                                                 "extra": m.extra, "at": at}))
+                    print(f"{READ_SUITE} {table} {method} N={threads}: wrong data, not timed ({message})", flush=True)
+                    continue
                 m = replace(m, nrows=nrows, ncols=ncols)
                 records.append(_append(out, {"type": "measure", "suite": READ_SUITE, "index": round_index,
-                                             "warmup": is_warmup, "at": at, **asdict(m)}))
+                                             "warmup": is_warmup, "at": at, "checksum_cast": cast, **asdict(m)}))
                 print(f"{READ_SUITE} {table} {method} N={threads}{' (warm-up)' if is_warmup else ''}: "
-                      f"{m.total_s:.3f} s", flush=True)
+                      f"{m.total_s:.3f} s{' (checksums on casts)' if cast else ''}", flush=True)
     finally:
         read_methods.reset_out_db()
     return records

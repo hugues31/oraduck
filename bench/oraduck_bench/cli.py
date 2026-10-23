@@ -1,4 +1,4 @@
-"""Entry point: oraduck-bench {smoke,tune,scaling,matrix,competitors,report,read-smoke,read-matrix,read-external}."""
+"""Entry point: oraduck-bench {smoke,tune,scaling,matrix,competitors,report,read-smoke,read-matrix,read-competitors,read-external}."""
 
 from __future__ import annotations
 
@@ -10,10 +10,22 @@ from pathlib import Path
 from . import read_runner, runner
 from .config import (COLS, RESULTS, ROWS, SCALING_CASE, SCALING_THREADS, THREADS, TUNE_STREAM_SIZES,
                      OracleConfig)
-from .read_config import READ_CASES, READ_RUNS
+from .read_config import READ_CASES, READ_COMPETITOR_RUNS, READ_COMPETITOR_SERIES, READ_RUNS
 
 
 TABLE_NAME = re.compile(r"^[A-Za-z0-9_$#]+(\.[A-Za-z0-9_$#]+)?$")
+
+
+def parse_only(values: list[str]) -> list[tuple[int, int]]:
+    """`--only 1000000x50` (repeatable): read cases to run; default all of them."""
+    cases = []
+    for value in values:
+        match = re.fullmatch(r"(\d+)x(\d+)", value)
+        if not match or (int(match[1]), int(match[2])) not in READ_CASES:
+            raise SystemExit(f"--only {value!r}: expected ROWSxCOLS, one of "
+                             f"{', '.join(f'{r}x{c}' for r, c in READ_CASES)}")
+        cases.append((int(match[1]), int(match[2])))
+    return cases
 
 
 def _check_affinity() -> None:
@@ -52,8 +64,13 @@ def _read_external(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="oraduck-bench")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("smoke", "tune", "scaling", "matrix", "competitors", "read-smoke", "read-matrix"):
+    for name in ("smoke", "tune", "scaling", "matrix", "competitors", "read-smoke"):
         sub.add_parser(name)
+    for name in ("read-matrix", "read-competitors"):
+        read_parser = sub.add_parser(name)
+        read_parser.add_argument("--only", action="append", default=[], metavar="ROWSxCOLS",
+                                 help="run only this case (repeatable)")
+        read_parser.add_argument("--runs", type=int, default=None, help="measured runs per method")
     external = sub.add_parser("read-external")
     external.add_argument("--dsn", required=True)
     external.add_argument("--user", required=True)
@@ -73,6 +90,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "read-external":
         return _read_external(args)
 
+    if getattr(args, "runs", None) is not None and args.runs < 1:
+        raise SystemExit("--runs must be at least 1")
+    only = parse_only(args.only) if hasattr(args, "only") else []
     _check_affinity()
     cfg = OracleConfig.from_env()
     out = runner.new_results_file(cfg, args.command)
@@ -98,9 +118,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{records[0]['method']}: {records[0]['total_s']:.3f} s\nchecksums OK")
     elif args.command == "read-matrix":
         timeouts: set[tuple[str, int, int]] = set()
-        for nrows, ncols in READ_CASES:
+        for nrows, ncols in only or READ_CASES:
             methods = ["oraduck", "oraduck_scan"] if (nrows, ncols) == (1_000_000, 550) else ["oraduck"]
-            read_runner.run_read_case(cfg, nrows, ncols, methods, READ_RUNS, out, timeouts=timeouts)
+            read_runner.run_read_case(cfg, nrows, ncols, methods, args.runs or READ_RUNS, out, timeouts=timeouts)
+    elif args.command == "read-competitors":
+        timeouts: set[tuple[str, int, int]] = set()
+        for nrows, ncols in only or READ_CASES:
+            for threads in dict.fromkeys(t for _, t in READ_COMPETITOR_SERIES):  # one interleaved group per N
+                methods = [m for m, t in READ_COMPETITOR_SERIES if t == threads]
+                read_runner.run_read_case(cfg, nrows, ncols, methods, args.runs or READ_COMPETITOR_RUNS, out,
+                                          threads=threads, timeouts=timeouts)
     print(f"results: {out}")
     return 0
 

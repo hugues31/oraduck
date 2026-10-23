@@ -22,6 +22,10 @@ def new_results_file(cfg: OracleConfig, suite: str) -> Path:
     env = env_info.collect(cfg)
     if suite == "competitors":
         env["competitors"] = competitors.versions()
+    elif suite == "read-competitors":
+        from . import read_methods
+
+        env["competitors"] = read_methods.versions()
     path.write_text(json.dumps(env) + "\n")
     return path
 

@@ -37,6 +37,8 @@ ORACLE_CONTAINER = "oraduck-ora19"
 
 # Comparison with other DuckDB -> Oracle extensions
 RINIE_EXTENSION = ROOT / ".deps" / "competitors" / "rinie" / "oracle.duckdb_extension"
+# DuckDB v1.5.5 CLI (infra/duckdb15/install.sh): runs the competitors that are not built for DuckDB 2.0
+DUCKDB15_CLI = ROOT / ".deps" / "duckdb-1.5.5" / "duckdb"
 RINIE_COMMIT = "20d4389"
 COMPETITOR_RUNS = 3
 # (method, DuckDB threads): OraDuck at N = 8 and N = 1 (the other extensions use a single session)

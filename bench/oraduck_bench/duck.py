@@ -40,8 +40,12 @@ class MethodTimeout(DuckDBError):
 
 
 def run(sql: str, db: Path | str = ":memory:", csv_output: bool = False, timeout_s: float | None = None,
-        unsigned: bool = False) -> str:
-    args = [str(DUCKDB_CLI), "-batch", "-bail", "-no-agent"]
+        unsigned: bool = False, cli: Path | None = None) -> str:
+    """`cli` selects another DuckDB CLI (the v1.5.5 one for extensions not built for 2.0)."""
+    cli = cli or DUCKDB_CLI
+    args = [str(cli), "-batch", "-bail"]
+    if cli == DUCKDB_CLI:  # v2.0 prints agent-mode output when AI_AGENT is set; v1.5 has no such option
+        args.append("-no-agent")
     if csv_output:
         args += ["-csv", "-noheader"]
     if unsigned:
@@ -58,14 +62,16 @@ def run(sql: str, db: Path | str = ":memory:", csv_output: bool = False, timeout
     return strip_warnings(proc.stdout)
 
 
-def query(sql: str, db: Path | str, unsigned: bool = False) -> list[list[str]]:
-    return [row for row in csv.reader(io.StringIO(run(sql, db, csv_output=True, unsigned=unsigned))) if row]
+def query(sql: str, db: Path | str, unsigned: bool = False, cli: Path | None = None) -> list[list[str]]:
+    return [row for row in csv.reader(io.StringIO(run(sql, db, csv_output=True, unsigned=unsigned, cli=cli)))
+            if row]
 
 
 def timed(setup: str, statement: str, db: Path | str, timeout_s: float | None = None,
-          unsigned: bool = False) -> float:
+          unsigned: bool = False, cli: Path | None = None) -> float:
     """Time in seconds of `statement` alone, measured by `.timer on`."""
-    out = run(f"{setup}\n.timer on\n{statement}\n.timer off\n", db, timeout_s=timeout_s, unsigned=unsigned)
+    out = run(f"{setup}\n.timer on\n{statement}\n.timer off\n", db, timeout_s=timeout_s, unsigned=unsigned,
+              cli=cli)
     times = _TIMER.findall(out)
     if len(times) != 1:
         raise DuckDBError(f"missing or ambiguous timing in the output:\n{out[-2000:]}")
@@ -74,3 +80,7 @@ def timed(setup: str, statement: str, db: Path | str, timeout_s: float | None = 
 
 def checksums(table: str, db: Path | str) -> Checksums:
     return Checksums(*(int(v) for v in query(DUCK_CHECKSUM_SQL.format(table=table), db)[0]))
+
+
+def version(cli: Path | None = None) -> str:
+    return query("SELECT version();", ":memory:", cli=cli)[0][0]

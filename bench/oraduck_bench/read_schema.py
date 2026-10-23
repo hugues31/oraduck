@@ -114,6 +114,11 @@ READ_CHECKSUM_DUCK = (
     "SELECT count(*), coalesce(sum(id), 0), coalesce(sum(length(v1)), 0), count(*) - count(d1), "
     "coalesce(sum(length(clob1)), 0) FROM {table};"
 )
+# Same values on casts, for methods that load numbers or text as other types (e.g. NUMBER as VARCHAR)
+READ_CHECKSUM_DUCK_CAST = (
+    "SELECT count(*), coalesce(sum(CAST(id AS HUGEINT)), 0), coalesce(sum(length(CAST(v1 AS VARCHAR))), 0), "
+    "count(*) - count(d1), coalesce(sum(length(CAST(clob1 AS VARCHAR))), 0) FROM {table};"
+)
 READ_CHECKSUM_ORACLE = (
     "SELECT COUNT(*), NVL(SUM(ID), 0), NVL(SUM(LENGTH(V1)), 0), COUNT(*) - COUNT(D1), "
     "NVL(SUM(LENGTH(CLOB1)), 0) FROM {table} WHERE {where}"

@@ -99,3 +99,11 @@ def test_a_run_over_the_limit_times_out_and_the_table_stays_usable():
     finally:
         oracle.drop_table(conn, table)
         conn.close()
+
+
+def test_parquet_source_for_the_1_5_5_cli(tmp_path):
+    setup, ref = competitors.parquet_source_sql("B_1000000_20", 1_000_000, 20, tmp_path / "x.parquet")
+    assert setup == f"CREATE TABLE src_mem AS SELECT * FROM read_parquet('{tmp_path / 'x.parquet'}');"
+    assert ref == "src_mem"
+    setup, ref = competitors.parquet_source_sql("B_10000000_50", 10_000_000, 50, tmp_path / "x.parquet")
+    assert setup == "" and ref.startswith("read_parquet(")

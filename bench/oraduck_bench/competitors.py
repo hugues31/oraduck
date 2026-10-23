@@ -6,13 +6,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from . import duck, schema
-from .config import (COMPETITOR_TIMEOUT_S, DUCKDB_FILE, FILE_SOURCE_CASES, ORACLE_SCHEMA, ORADUCK_STREAM_SIZE,
-                     RINIE_EXTENSION, OracleConfig)
+from .config import (COMPETITOR_TIMEOUT_S, DUCKDB15_CLI, DUCKDB_FILE, FILE_SOURCE_CASES, ORACLE_SCHEMA, ORADUCK_STREAM_SIZE,
+                     RINIE_EXTENSION, WORK, OracleConfig)
 from .duck import MethodTimeout
 from .methods import Measurement, _secret
 
-__all__ = ["MethodTimeout", "method_sql", "run", "should_skip", "source_sql", "versions"]
+__all__ = ["MethodTimeout", "cli_for", "export_source", "method_sql", "parquet_source_sql", "run", "should_skip", "source_sql", "versions"]
 
 MEMORY_TABLE = "src_mem"
 
@@ -23,6 +25,24 @@ def source_sql(table: str, nrows: int, ncols: int) -> tuple[str, str]:
     if (nrows, ncols) in FILE_SOURCE_CASES:
         return setup, f"src.{table}"
     return f"{setup}\nCREATE TABLE {MEMORY_TABLE} AS SELECT * FROM src.{table};", MEMORY_TABLE
+
+
+def parquet_source_sql(table: str, nrows: int, ncols: int, parquet: Path) -> tuple[str, str]:
+    """Same as source_sql for the 1.5.5 CLI, which cannot open the 2.0 database file: a Parquet export of it."""
+    if (nrows, ncols) in FILE_SOURCE_CASES:
+        return "", f"read_parquet('{parquet}')"
+    return f"CREATE TABLE {MEMORY_TABLE} AS SELECT * FROM read_parquet('{parquet}');", MEMORY_TABLE
+
+
+def export_source(table: str) -> Path:
+    """Parquet copy of a source table (made once, by the 2.0 CLI, not timed)."""
+    path = WORK / "parquet" / f"{table}_src15.parquet"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        duck.run(f"ATTACH '{DUCKDB_FILE}' AS src (READ_ONLY);\nCOPY src.{table} TO '{tmp}' (FORMAT parquet);")
+        tmp.rename(path)
+    return path
 
 
 def method_sql(method: str, cfg: OracleConfig, oracle_table: str, source: str,
@@ -49,6 +69,12 @@ def method_sql(method: str, cfg: OracleConfig, oracle_table: str, source: str,
     raise ValueError(f"unknown method {method!r}")
 
 
+def cli_for(method: str):
+    """The 1.5.5 CLI for the two extensions (the community build 0.2.2 and Rinie's are not built for DuckDB 2.0);
+    None is the 2.0 CLI. The 1.5.5 CLI cannot open the 2.0 database file: its source is a Parquet export."""
+    return DUCKDB15_CLI if method in ("quack_oracle", "rinie_oracle") else None
+
+
 def should_skip(timeouts: set[tuple[str, int, int]], method: str, nrows: int, ncols: int) -> bool:
     """A method that timed out is not run on cases with at least as many rows and columns."""
     return any(m == method and nrows >= r and ncols >= c for m, r, c in timeouts)
@@ -58,9 +84,13 @@ def run(cfg: OracleConfig, method: str, nrows: int, ncols: int, threads: int,
         timeout_s: float = COMPETITOR_TIMEOUT_S, oracle_table: str | None = None) -> Measurement:
     """One timed load; raises MethodTimeout when the DuckDB CLI runs longer than timeout_s."""
     table = schema.table_name(nrows, ncols)
-    source_setup, source = source_sql(table, nrows, ncols)
+    if cli_for(method) is None:
+        source_setup, source = source_sql(table, nrows, ncols)
+    else:
+        source_setup, source = parquet_source_sql(table, nrows, ncols, export_source(table))
     setup, statement, unsigned = method_sql(method, cfg, oracle_table or table, source, threads)
-    total = duck.timed(f"{setup}\n{source_setup}", statement, ":memory:", timeout_s=timeout_s, unsigned=unsigned)
+    total = duck.timed(f"{setup}\n{source_setup}", statement, ":memory:", timeout_s=timeout_s, unsigned=unsigned,
+                       cli=cli_for(method))
     stream_size = ORADUCK_STREAM_SIZE if method == "oraduck" else None
     return Measurement(method, table, nrows, ncols, threads, total, stream_size=stream_size)
 
@@ -68,6 +98,8 @@ def run(cfg: OracleConfig, method: str, nrows: int, ncols: int, threads: int,
 def versions() -> dict[str, str]:
     """Versions reported by the two other extensions (duckdb_extensions())."""
     sql = "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = '{}';"
-    quack = duck.query(f"LOAD oracle_scanner;\n{sql.format('oracle_scanner')}", ":memory:")
-    rinie = duck.query(f"LOAD '{RINIE_EXTENSION}';\n{sql.format('oracle')}", ":memory:", unsigned=True)
+    quack = duck.query(f"INSTALL oracle_scanner FROM community;\nLOAD oracle_scanner;\n{sql.format('oracle_scanner')}",
+                       ":memory:", cli=cli_for("quack_oracle"))
+    rinie = duck.query(f"LOAD '{RINIE_EXTENSION}';\n{sql.format('oracle')}", ":memory:", unsigned=True,
+                       cli=cli_for("rinie_oracle"))
     return {"quack_oracle": quack[0][0], "rinie_oracle": rinie[0][0]}

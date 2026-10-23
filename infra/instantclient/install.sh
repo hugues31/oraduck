@@ -2,7 +2,7 @@
 # Downloads Oracle Instant Client 19.32 into .deps/instantclient_19_32
 #   usage: install.sh [PLATFORM] [PACKAGE...]
 #   PLATFORM: linux-x64 (default), linux-arm64, windows-x64
-#   PACKAGE:  basic, sdk, tools (default: basic tools; tools = sqlldr, used by the benchmark;
+#   PACKAGE:  basic, sdk, tools, sqlplus (default: basic tools; tools = sqlldr, sqlplus = SQL*Plus, used by the benchmark;
 #             the SDK is not needed: OraDuck loads OCI at run time)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
