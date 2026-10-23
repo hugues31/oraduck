@@ -1,7 +1,8 @@
 # OraDuck read path: `oraduck_scan` (design)
 
 - **Date**: 2026-10-23
-- **Status**: draft, awaiting approval
+- **Status**: approved 2026-10-23; amended the same day (read-only `ATTACH`
+  added at Hugues's request; extent planning revised from the probe results)
 - **Author**: Hugues Gaillard (with Claude)
 - **Target release**: v0.4.0 (*Claude's call*)
 
@@ -63,19 +64,26 @@ pruning). The Exadata side is not expected to be the bottleneck.
    CREATE VIEW toto AS FROM oraduck_scan('MY_SCHEMA.TOTO', connection := 'oracle_test');
    SELECT * FROM toto WHERE id_partition = 20240507;   -- filter executed by Oracle
    ```
-3. **DuckDB 2.0 only** (see section 8). DuckDB 1.5.x support is dropped.
-4. The code is layered so that the DuckDB "trio" can be added later with little
-   work: `ATTACH` (catalog), `oraduck_scan`, `oraduck_query` (raw SQL
-   passthrough). See section 6.
-5. A benchmark against the equivalent solutions (section 10), with a report in
+3. **Read-only `ATTACH`** (section 4.7, added at Hugues's request): an Oracle
+   database attached as a DuckDB catalog, read through the same engine as
+   `oraduck_scan`:
+   ```sql
+   ATTACH '' AS ora (TYPE oraduck, SECRET oracle_test);
+   SELECT * FROM ora.MY_SCHEMA.TOTO WHERE id_partition = DATE '2024-05-07';
+   ```
+4. **DuckDB 2.0 only** (see section 8). DuckDB 1.5.x support is dropped.
+5. The code is layered so that `oraduck_query` (raw SQL passthrough), the last
+   member of the DuckDB "trio" with `ATTACH` and `oraduck_scan`, can be added
+   later with little work. See section 6.
+6. A benchmark against the equivalent solutions (section 10), with a report in
    the style of `bench/REPORT.md`.
 
 ### Non-goals (this version)
 
-- `ATTACH … (TYPE oraduck)` and `oraduck_query`. The architecture prepares
-  them, but neither is delivered.
-- Writing through the read path (`INSERT INTO` an attached table); the COPY
-  writer stays the write path and keeps its behaviour.
+- `oraduck_query`. The architecture prepares it, but it is not delivered.
+- Writing through `ATTACH` (`INSERT`, `UPDATE`, `DELETE`, DDL on an attached
+  Oracle database): the attached database is read-only; the COPY writer stays
+  the write path and keeps its behaviour.
 - Pushing down joins, aggregates, `ORDER BY` or `LIMIT` to Oracle.
 - Join-derived (dynamic, run-time) filters from DuckDB.
 - Caching Oracle data between queries: every query on the view reads Oracle
@@ -225,10 +233,17 @@ slice.
 
 `split = 'auto'` tries, in order (*Claude's call*, approved in conversation):
 
-1. **`extents`**: ROWID ranges built from the extent map (`DBA_EXTENTS`, or
-   `USER_EXTENTS` when the reading user owns the table), predicate
-   `ROWID BETWEEN :lo AND :hi`. Each session reads distinct blocks. With LIST
-   subpartitions, the segments are the subpartitions. Units must
+1. **`extents`**: ROWID ranges, so that each session reads distinct blocks.
+   They come from `DBA_EXTENTS` when the reading user can read it (OraDuck
+   builds the ranges), otherwise from
+   `DBMS_PARALLEL_EXECUTE.CREATE_CHUNKS_BY_ROWID`, which needs only `SELECT`
+   on the table (the probe confirmed it; it writes a temporary task in
+   Oracle's dictionary, dropped right after, which the README states).
+   `USER_EXTENTS` cannot be used: it has no block addresses. Units are sized
+   from the largest segment, not from the whole table, so that a filtered
+   partition of a large table is still cut into enough units for every
+   session. With LIST subpartitions, the segments are the subpartitions.
+   Units must
    cover every row that matches the filter; units that fall in partitions
    eliminated by the filter must cost almost nothing; the planning queries
    must stay a small fraction of the read (target under 2 %, measured). How
@@ -240,13 +255,14 @@ slice.
    absorbs, but the network carries each row once.
 3. **`none`**: one session.
 
-A forced strategy that cannot run (for example `split = 'extents'` without
-access to the extent map) is an error that says why. The chosen strategy, the
-number of units and the generated Oracle SQL are visible in `EXPLAIN` output
-(the table function's `to_string`).
+A forced strategy that cannot run (for example `split = 'extents'` on a
+view) is an error that says why. `EXPLAIN` shows the pushed `WHERE` and the
+requested options; the chosen strategy, the number of units and the generated
+Oracle SQL are visible in `EXPLAIN ANALYZE` (the work plan is computed at each
+execution: ROWID ranges go stale after a `TRUNCATE`).
 
-A view, or a table whose extents the user cannot read, falls back to `hash`
-automatically. A view without identifiable base-table rows (a join or
+A view, or a table for which neither extent source works, falls back to
+`hash` automatically. A view without identifiable base-table rows (a join or
 aggregate view: `ORA_HASH(ROWID)` raises ORA-01445) falls back to `none`.
 
 ### 4.5 Read consistency
@@ -269,6 +285,38 @@ pruning; if it does, the default becomes `'none'` and the report says why.
   `SELECT a, b` work on a table with an `XMLTYPE` column).
 - A DuckDB interrupt (Ctrl-C) stops the fetches promptly (`OCIBreak` /
   `OCIReset` or closing the sessions) and releases every session.
+
+### 4.7 Read-only `ATTACH`
+
+```sql
+ATTACH '' AS ora (TYPE oraduck, SECRET oracle_test
+                  [, SESSIONS n] [, SPLIT '…'] [, SNAPSHOT '…'] [, UNCONSTRAINED_NUMBER '…']);
+SELECT * FROM ora.MY_SCHEMA.TOTO WHERE id_partition = DATE '2024-05-07';
+SELECT * FROM ora.TOTO;              -- the connected user's schema
+SHOW TABLES FROM ora.MY_SCHEMA;
+DETACH ora;
+```
+
+- `SECRET` (required) names an `oraduck` secret; the path must be empty.
+- DuckDB schemas are Oracle users. The default schema of the attached
+  database is the session's current schema, so `ora.TOTO` works.
+- Lookups are lazy: `ATTACH` reads no dictionary beyond what it needs to
+  connect; a table is described when a query names it; `SHOW TABLES` on one
+  schema describes that schema's tables and views in bulk (one dictionary
+  query per schema, not one per table). Listing every schema
+  (`SHOW ALL TABLES`) is allowed but can be slow on a large database.
+- Identifiers are matched like Oracle's unquoted names when no exact match
+  exists (`ora.my_schema.toto` finds `MY_SCHEMA.TOTO`); tables, views and
+  synonyms are readable, tables and views are listed.
+- Every table of the attached database is read by `oraduck_scan`'s engine:
+  same projection and filter pushdown, parallelism, snapshot and type
+  mapping. The `ATTACH` options are the defaults of every scan of that
+  database, with the same names and values as `oraduck_scan`'s parameters.
+- Descriptions are cached for the life of the attachment; `DETACH` then
+  `ATTACH` refreshes them.
+- The database is read-only: any write or DDL statement on it fails with an
+  error that points to `COPY … (FORMAT ORADUCK)`.
+- `oraduck_scan` stays available; the view approach keeps working.
 
 ## 5. Performance design
 
@@ -356,19 +404,20 @@ the requirement.
 | Read plan | Projection + translated filter + slice predicate + snapshot → SQL text and binds. Pure, unit-tested. | no |
 | Splitter | Builds the work units for a read plan (extents, hash, none). Needs a session for the dictionary queries. | no |
 | Fetch cursor | One statement on one session: prepare, bind, define, execute, array fetch, LOB handling, decoding into a DuckDB `DataChunk`. | vectors only |
-| `oraduck_scan` glue | DuckDB table function: bind, filter pushdown, global/local init, scan, `to_string`, cardinality. The only layer, with the filter translator's expression input, that depends on DuckDB's planner APIs, so that a DuckDB upgrade touches few files. | yes |
+| `oraduck_scan` glue | DuckDB table function: bind, filter pushdown, global/local init, scan, `to_string`, cardinality. The only layer, with the filter translator's expression input and the catalog, that depends on DuckDB's planner APIs, so that a DuckDB upgrade touches few files. | yes |
+| Catalog (`ATTACH`) | Storage extension `oraduck`, catalog, schema and table entries, a no-op transaction manager. Table entries hold an `OracleTableDescription` and return `oraduck_scan`'s table function with bind data built from it. Write and DDL paths throw. | yes |
 
 Seams that must exist so that the later work is small:
 
 - The scan's bind data can be built **from an `OracleTableDescription`**
-  directly, not only from the function's string argument. A future
-  `OracleTableEntry::GetScanFunction` (ATTACH) then returns the same table
+  directly, not only from the function's string argument:
+  `OracleTableEntry::GetScanFunction` (ATTACH) returns the same table
   function with bind data built from its cached description.
 - The fetch cursor and the type mapping work on a **column description**, not
   on a table: `oraduck_query` = query description + read plan without filter
   pushdown or splitting (one unit) + the same fetch cursor.
 - Session handling (secret → credentials → `OciSession`) is shared by the
-  writer, the scan and a future catalog.
+  writer, the scan and the catalog.
 
 ## 7. Behaviour details left open on purpose
 
@@ -419,13 +468,19 @@ Same structure as the writer (`docs/design.md` section 10), plus:
     `DBMS_XPLAN.DISPLAY_CURSOR` on its `SQL_ID`, or segment statistics);
   - projection pushdown proven (only the selected columns in the generated SQL);
   - the view approach (4.2) pushes filters and projections like a direct call;
-  - each split strategy, forced, gives identical results; `auto` falls back to
-    `hash` for a user without access to the extent map (a dedicated test user
-    with only `SELECT` on the tables);
+  - each split strategy, forced, gives identical results, with both extent
+    sources (`DBA_EXTENTS` for a user granted it, `DBMS_PARALLEL_EXECUTE` for
+    a dedicated test user with only `SELECT` on the tables); `auto` falls
+    back to `hash` on a view;
   - snapshot modes, including the fallback when `FLASHBACK` is missing;
   - unsupported column selected → error; not selected → works;
   - interrupt during a large read releases all sessions;
-  - errors: missing table, wrong password, invalid options.
+  - errors: missing table, wrong password, invalid options;
+  - `ATTACH`: default schema, case-insensitive names, `SHOW TABLES`,
+    `information_schema.columns`, tables, views and synonyms, filter and
+    projection pushdown and partition pruning through the catalog, `ATTACH`
+    options applied, two attached databases in one query, refresh by
+    `DETACH`/`ATTACH`, read-only errors, missing secret or table.
 - The writer's existing tests keep passing.
 - Partitioned test tables cover the production shapes: LIST partitioning on a
   `DATE` key and on a `VARCHAR2` key, with and without LIST subpartitions;
@@ -442,7 +497,7 @@ DuckDB.
 
 | Method | How |
 |---|---|
-| OraDuck | `CREATE TABLE t AS SELECT * FROM oraduck_scan(…) WHERE id_partition = X`, N = 8 and N = 1 |
+| OraDuck | `ATTACH` then `CREATE TABLE t AS SELECT * FROM ora.BENCH.<table> WHERE …` (the syntax the other extensions use), N = 8 and N = 1; one case also through `oraduck_scan` to show both paths match |
 | quack-oracle | community extension `oracle_scanner`, `ATTACH` then `CREATE TABLE … AS SELECT … WHERE …` |
 | duckdb-oracle (rinie) | built from source as today, `ATTACH` then the same statement |
 | python-oracledb + Arrow | `fetch_df_batches` (Arrow) streamed into DuckDB, thin mode (and thick if it differs notably) |
@@ -508,13 +563,15 @@ Results are reported as measured, including cases where OraDuck does not win.
 
 ## 11. Deliverables
 
-- `oraduck_scan` in the extension, for DuckDB v2.0.0.
+- `oraduck_scan` and read-only `ATTACH` in the extension, for DuckDB v2.0.0.
 - Tests of section 9, in the existing CI.
 - Probe results for the read path in `docs/probe-results.md`.
 - `docs/design.md` updated with the read path (or a sibling document it links).
-- README: "Read from Oracle" section (view approach, options, network options
-  in the DSN, type mapping, constants written in the column's type), and the
-  note that each DuckDB release needs a matching OraDuck build.
+- README: "Read from Oracle" section (`ATTACH` first, then `oraduck_scan` and
+  the view approach, options, network options in the DSN, type mapping,
+  constants written in the column's type, the temporary
+  `DBMS_PARALLEL_EXECUTE` task), and the note that each DuckDB release needs
+  a matching OraDuck build.
 - `bench/REPORT_READ.md` (or a new section of `bench/REPORT.md`) with charts.
 - Release v0.4.0.
 

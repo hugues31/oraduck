@@ -2,7 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a DuckDB table function `oraduck_scan` that reads Oracle tables, views and synonyms into DuckDB at the network's line rate, with projection and filter pushdown (partition pruning) and parallel Oracle sessions, then benchmark it against five equivalent solutions.
+**Goal:** Add a DuckDB table function `oraduck_scan` and a read-only `ATTACH … (TYPE oraduck)` catalog that read Oracle tables, views and synonyms into DuckDB at the network's line rate, with projection and filter pushdown (partition pruning) and parallel Oracle sessions, then benchmark them against five equivalent solutions.
+
+**Amendments (2026-10-23, after Task 3):** the probe's decisions are folded into Tasks 4, 5, 7 and 8 below (`INTEGER_DEFINE = sqlt_int`, `TIMESTAMP_DEFINE = internal180`, `LOB_TECHNIQUE = lob_prefetch`, `FETCH_BUDGET_BYTES = 67108864`, `PREFETCH_MEMORY_BYTES = 0`, `SNAPSHOT_DEFAULT = auto`); ROWID ranges come from `DBA_EXTENTS` or `DBMS_PARALLEL_EXECUTE` (`USER_EXTENTS` has no block address); read-only `ATTACH` is added as Task 10b at Hugues's request.
 
 **Architecture:** Layers without DuckDB (decoders, type mapping, filter → SQL, scan SQL, rowid ranges: pure and unit-tested; source description, fetch cursor, work planning: OCI, integration-tested) under a thin DuckDB glue (`oraduck_scan` table function, expression → filter translation, vector writers). The glue's bind data can be built from an `OracleTableDescription`, so a later `ATTACH` and `oraduck_query` reuse every layer.
 
@@ -252,14 +254,14 @@ git commit -m "Add the read probe and record the fetch decisions"
   - `struct UnconstrainedNumber { enum class Kind { kDouble, kVarchar, kDecimal } kind = Kind::kDouble; uint8_t width = 0; uint8_t scale = 0; };`
   - `UnconstrainedNumber ParseUnconstrainedNumber(const std::string &text);` accepts `DOUBLE`, `VARCHAR`, `DECIMAL(p,s)` (case-insensitive, spaces allowed, 1 ≤ p ≤ 38, 0 ≤ s ≤ p); throws `OraduckError` naming the accepted forms.
   - `bool IsUtf8Charset(const std::string &charset);` true for `AL32UTF8` and `UTF8`.
-  - `struct ReadColumnPlan { std::string name; std::string select_expr; DuckTypeSpec duck_type; FetchDecoder decoder; ub2 dty = 0; uint32_t define_bytes = 0; bool national = false; bool dynamic = false; uint8_t scale = 0; bool round = false; std::string unsupported; };`
+  - `struct ReadColumnPlan { std::string name; std::string select_expr; DuckTypeSpec duck_type; FetchDecoder decoder; ub2 dty = 0; uint32_t define_bytes = 0; bool national = false; bool lob = false; uint8_t scale = 0; bool round = false; std::string unsupported; };` (`lob`: fetched through LOB locators with LOB prefetch, `LOB_TECHNIQUE = lob_prefetch`)
   - `ReadColumnPlan PlanReadColumn(const OracleColumn &column, const UnconstrainedNumber &unconstrained, const std::string &db_charset);`
 
 Mapping rules (spec 5.3; `select_expr` is the double-quoted column name unless stated):
 
 | Oracle (`data_type`, precision p, scale s) | `duck_type` | `decoder` / `dty` / `define_bytes` |
 |---|---|---|
-| `NUMBER`, p in 1..4, s = 0 | SMALLINT | per `INTEGER_DEFINE`: `kNumberInt64`/`SQLT_NUM`/22 or `kNativeInt64`/`SQLT_INT`/8 |
+| `NUMBER`, p in 1..4, s = 0 | SMALLINT | `kNativeInt64`/`SQLT_INT`/8 (`INTEGER_DEFINE = sqlt_int`) |
 | `NUMBER`, p in 5..9, s = 0 | INTEGER | same |
 | `NUMBER`, p in 10..18, s = 0 | BIGINT | same |
 | `NUMBER`, p ≤ 18, s in 1..p | DECIMAL(p,s) | `kNumberDecimal64`/`SQLT_NUM`/22 |
@@ -270,18 +272,18 @@ Mapping rules (spec 5.3; `select_expr` is the double-quoted column name unless s
 | `NUMBER` with precision and scale NULL, `FLOAT(b)` | per `unconstrained`: DOUBLE / VARCHAR / DECIMAL(p,s) | `kNativeDouble`/`SQLT_BDOUBLE`/8, `kNumberText`/`SQLT_NUM`/22, or decimal decoders with `round = true` |
 | `BINARY_FLOAT` / `BINARY_DOUBLE` | FLOAT / DOUBLE | `kNativeFloat`/`SQLT_BFLOAT`/4, `kNativeDouble`/`SQLT_BDOUBLE`/8 |
 | `DATE` | TIMESTAMP | `kDate`/`SQLT_DAT`/7 |
-| `TIMESTAMP(n)` | TIMESTAMP | per `TIMESTAMP_DEFINE`: `kTimestamp`/180/11, or `kTimestampText`/`SQLT_CHR`/26 with `select_expr` `TO_CHAR("C", 'YYYY-MM-DD HH24:MI:SS.FF6')` |
+| `TIMESTAMP(n)` | TIMESTAMP | `kTimestamp`/180 (`kInternalTimestamp`)/11 (`TIMESTAMP_DEFINE = internal180`) |
 | `TIMESTAMP(n) WITH TIME ZONE` | TIMESTAMPTZ | as `TIMESTAMP`, `select_expr` `SYS_EXTRACT_UTC("C")` |
 | `TIMESTAMP(n) WITH LOCAL TIME ZONE` | TIMESTAMPTZ | as `TIMESTAMP`, `select_expr` `SYS_EXTRACT_UTC(CAST("C" AS TIMESTAMP WITH TIME ZONE))` |
 | `VARCHAR2`, `CHAR` | VARCHAR | `kString`/`SQLT_CHR`; `define_bytes` = `data_length` when `IsUtf8Charset(db_charset)`, else `data_length × 3` |
 | `NVARCHAR2`, `NCHAR` (`national`) | VARCHAR | `kString`/`SQLT_CHR`, `national = true`, `define_bytes` = `data_length × 3 / 2` (AL16UTF16 bytes → UTF-8) rounded up |
-| `CLOB`, `NCLOB` | VARCHAR | `kString`, per `LOB_TECHNIQUE` (`dynamic = true` for `dynamic_define`) |
+| `CLOB`, `NCLOB` | VARCHAR | `kString`/`SQLT_CLOB`, `lob = true`, `define_bytes` = 8 (a locator pointer); `NCLOB` also `national = true` |
 | `RAW` | BLOB | `kBinary`/`SQLT_BIN`/`data_length` |
-| `BLOB` | BLOB | `kBinary`, per `LOB_TECHNIQUE` |
+| `BLOB` | BLOB | `kBinary`/`SQLT_BLOB`, `lob = true`, `define_bytes` = 8 |
 | `ROWID`, `UROWID` | VARCHAR | `kString`/`SQLT_CHR`/4000, `select_expr` `ROWIDTOCHAR("C")` (UROWID: `CAST("C" AS VARCHAR2(4000))`) |
 | anything else (`LONG`, `LONG RAW`, `XMLTYPE`, `JSON`, `VECTOR`, `BFILE`, `INTERVAL …`, object and collection types) | VARCHAR | `kUnsupported`, `unsupported` = `"column \"C\" has Oracle type T, which oraduck_scan does not read"` |
 
-INTERVAL types are deferred (the spec allows it); they take the last row.
+INTERVAL types are deferred (the spec allows it); they take the last row. `kNumberInt64` and `kTimestampText` stay in the enum unused (the probe chose `sqlt_int` and `internal180`); do not add a text timestamp parser.
 
 - [ ] **Step 1: Write the failing tests**: one `SECTION` per row of the table, building an `OracleColumn` and checking `duck_type`, `decoder`, `dty`, `define_bytes` and `select_expr`; plus:
 
@@ -341,14 +343,14 @@ git commit -m "Map Oracle columns to DuckDB types and fetch plans"
   - `enum class SplitStrategy { kAuto, kExtents, kHash, kNone };` `SplitStrategy ParseSplitStrategy(const std::string &);`
   - `enum class SnapshotMode { kAuto, kScn, kNone };` `SnapshotMode ParseSnapshotMode(const std::string &);` (both case-insensitive, throw `OraduckError` listing the accepted values)
   - `enum class SliceKind { kNone, kRowidRange, kHash };`
-  - `struct Slice { SliceKind kind = SliceKind::kNone; std::string rowid_lo, rowid_hi; uint32_t hash_buckets = 0, hash_bucket = 0; };` (ROWID range is half-open `[lo, hi)`)
+  - `struct Slice { SliceKind kind = SliceKind::kNone; std::string rowid_lo, rowid_hi; bool hi_inclusive = false; uint32_t hash_buckets = 0, hash_bucket = 0; };` (ROWID range half-open `[lo, hi)`, or closed `[lo, hi]` when `hi_inclusive`, as `DBMS_PARALLEL_EXECUTE` chunks are)
   - `struct ScanSqlInput { std::string owner, object; std::vector<const ReadColumnPlan *> columns; std::vector<SqlFragment> filters; std::string snapshot_scn; };`
   - `std::string QuoteIdentifier(const std::string &name);` → `"NAME"` (dictionary names are used as is).
   - `SqlStatement BuildScanSql(const ScanSqlInput &input, const Slice &slice);`
 - Produces in `rowid_ranges.hpp`:
   - `std::string EncodeRowid(uint32_t data_object_id, uint32_t relative_fno, uint32_t block, uint16_t row);` extended ROWID `OOOOOOFFFBBBBBBRRR` in base 64 (`A–Z a–z 0–9 + /`); when `relative_fno == 1024` (bigfile tablespace), the file field holds `block >> 22` and the block field `block & 0x3FFFFF`.
   - `struct SegmentExtent { uint32_t data_object_id; uint32_t relative_fno; uint32_t block_id; uint32_t blocks; };`
-  - `uint64_t TargetBlocks(uint64_t total_blocks, uint32_t sessions);` = `max(ceil(total_blocks / (4 × sessions)), 128)`.
+  - `uint64_t TargetBlocks(uint64_t largest_segment_blocks, uint32_t sessions);` = `max(ceil(largest_segment_blocks / (4 × sessions)), 128)` — sized from the largest segment, so that a partition kept by the filter is cut into enough units even in a large table.
   - `std::vector<Slice> BuildRowidSlices(std::vector<SegmentExtent> extents, uint64_t target_blocks);`
 
 Translation rules (spec 4.3; one unit test per bullet):
@@ -363,7 +365,7 @@ SQL shape of `BuildScanSql` (binds in this order: snapshot, filters, slice):
 SELECT /* oraduck_scan */ <select_expr, …> FROM "OWNER"."OBJECT"[ AS OF SCN TO_NUMBER(:b1)][ WHERE <f1> AND <f2> … [AND <slice>]]
 ```
 
-with `<select_expr, …>` = `1` when `columns` is empty; slice `ROWID >= CHARTOROWID(:bN) AND ROWID < CHARTOROWID(:bM)` or `ORA_HASH(ROWID, :bN) = :bM` (binds `hash_buckets - 1` and `hash_bucket`).
+with `<select_expr, …>` = `1` when `columns` is empty; slice `ROWID >= CHARTOROWID(:bN) AND ROWID < CHARTOROWID(:bM)`, or `ROWID BETWEEN CHARTOROWID(:bN) AND CHARTOROWID(:bM)` when `hi_inclusive`, or `ORA_HASH(ROWID, :bN) = :bM` (binds `hash_buckets - 1` and `hash_bucket`).
 
 `BuildRowidSlices`: group extents by `data_object_id`; per object, sort by `(relative_fno, block_id)` and cut a new unit when the accumulated blocks reach `target_blocks`; unit boundaries are `EncodeRowid(obj, 0, 0, 0)` for the first unit of an object, `EncodeRowid(obj, fno, block_id, 0)` of the extent that opens each next unit, and `EncodeRowid(obj + 1, 0, 0, 0)` after the last; consecutive units share their boundary (`hi` of one = `lo` of the next), so the units cover every row of the object exactly once. Largest units first.
 
@@ -416,7 +418,8 @@ TEST_CASE("BuildScanSql", "[read_sql]") {
 	                 "WHERE (\"ID\" = :b2) AND ORA_HASH(ROWID, :b3) = :b4");
 	CHECK(sql.binds.size() == 4);
 	// No column: "SELECT /* oraduck_scan */ 1 FROM …"; no filter and no slice: no WHERE; ROWID slice:
-	// "ROWID >= CHARTOROWID(:bN) AND ROWID < CHARTOROWID(:bM)".
+	// "ROWID >= CHARTOROWID(:bN) AND ROWID < CHARTOROWID(:bM)"; inclusive ROWID slice (hi_inclusive):
+	// "ROWID BETWEEN CHARTOROWID(:bN) AND CHARTOROWID(:bM)".
 }
 ```
 
@@ -498,19 +501,23 @@ git commit -m "Describe Oracle tables, views and synonyms for reading"
 **Interfaces:**
 - Consumes: `OciSession`, `SqlStatement`, `BindValue` (Task 5), `ReadColumnPlan` (Task 4), the decisions of Task 3, decoders (Task 2) in tests.
 - Produces:
-  - `struct FetchOptions { uint64_t buffer_budget_bytes; uint32_t prefetch_memory_bytes; uint32_t max_rows = 2048; };` defaults from `FETCH_BUDGET_BYTES` and `PREFETCH_MEMORY_BYTES`.
+  - `struct FetchOptions { uint64_t buffer_budget_bytes = 67108864; uint32_t prefetch_memory_bytes = 0; uint32_t max_rows = 8192; uint32_t lob_prefetch_chars = 32768; };` (probe decisions: 64 MiB budget, no OCI prefetch, 8,192 rows per fetch on narrow rows, LOB prefetch of 32,768 characters)
   - `class FetchCursor` (non-copyable, RAII on the statement):
     - `FetchCursor(OciSession &session, const SqlStatement &statement, std::vector<const ReadColumnPlan *> columns, const FetchOptions &options);` prepares, binds, defines and executes.
     - `uint32_t Fetch();` next batch; returns its row count, 0 at the end.
     - `uint32_t rows_per_fetch() const;` = clamp(budget / Σ(define_bytes + 8), 1, max_rows).
-    - `const uint8_t *Value(size_t column, uint32_t row, uint32_t &length) const;` bytes of a value in the last batch, `nullptr` for NULL; LOB values are contiguous whatever `LOB_TECHNIQUE` does internally.
+    - `const uint8_t *Value(size_t column, uint32_t row, uint32_t &length) const;` bytes of a value in the last batch, `nullptr` for NULL; LOB values are read from their locators (`OCILobRead2`, served from the LOB prefetch for values up to `lob_prefetch_chars`) into a per-batch buffer, contiguous; `EMPTY_CLOB()` gives length 0, not NULL.
   - Columns with `national` set `OCI_ATTR_CHARSET_FORM = SQLCS_NCHAR` on their define. Unsupported columns never reach the cursor (the glue rejects them first).
+  - With an empty column list, the cursor defines select-list position 1 itself (the constant `1` of `BuildScanSql`), so `Fetch()` still returns row counts.
+  - The probe's `Cursor` in `tools/read_probe.cpp` (LOB locator arrays, `OCI_ATTR_LOBPREFETCH_SIZE`/`OCI_ATTR_LOBPREFETCH_LENGTH` on the define, descriptor cleanup on every path) is the reference for the OCI calls.
 
 - [ ] **Step 1: Write the failing integration tests**:
   - every type of spec 5.3 read back and decoded with the Task 2 decoders, compared with `TO_CHAR`/`DUMP` values from Oracle: NULLs in every column, multi-byte UTF-8 (`é`, `漢字`, emoji), `NVARCHAR2`, `CHAR(3)` value `'A  '` kept padded;
   - CLOBs: NULL, `EMPTY_CLOB()` (length 0, not NULL), 10 bytes, 5,000 bytes, 2 MB with multi-byte characters at the piece boundaries, compared byte for byte;
   - a 550-column table (200 `VARCHAR2(4000)` columns) with a 16 MiB budget: `rows_per_fetch()` ≥ 16 and all rows read;
-  - round trips: reading 100,000 rows of a table with 5 small CLOB columns costs at most 1,000 `SQL*Net roundtrips to/from client` (`V$MYSTAT` delta);
+  - an empty column list on `SELECT 1 FROM t` (1,000 rows): the batches add up to 1,000 rows;
+  - round trips: reading 100,000 rows of a table with 5 small CLOB columns costs at most 1,000 `SQL*Net roundtrips to/from client` and at most 1,000 `user calls` (`V$MYSTAT` deltas; the round-trip statistic alone misses LOB reads);
+  - a 2 MB CLOB of 4-byte characters read correctly even if the cursor reads LOBs in more than one `OCILobRead2` call (no surrogate pair split at a call boundary);
   - an ORA error during the fetch (view `SELECT id, 1 / (id - 50000) AS x FROM t`, 100,000 rows) throws `OracleError` with `ora_code == 1476`.
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -518,7 +525,7 @@ git commit -m "Describe Oracle tables, views and synonyms for reading"
 Run: `source env.sh && make itest`
 Expected: compile error (`fetch_cursor.hpp` not found).
 
-- [ ] **Step 3: Implement `FetchCursor`**: `OCIStmtPrepare2`, binds with `OCIBindByPos` in order, `OCI_ATTR_PREFETCH_ROWS = 0` and `OCI_ATTR_PREFETCH_MEMORY`, one define per column (array of `rows_per_fetch` values, indicators `sb2`, lengths `ub4` through `OCIDefineByPos2`), LOBs per `LOB_TECHNIQUE`, `OCIStmtExecute(iters = 0)`, then `OCIStmtFetch2(rows_per_fetch)` with the row count from `OCI_ATTR_ROWS_FETCHED` (rows may come with `OCI_NO_DATA`). Add the file to `OCI_SRCS` and `EXTENSION_SOURCES`.
+- [ ] **Step 3: Implement `FetchCursor`**: `OCIStmtPrepare2`, binds with `OCIBindByPos` in order, `OCI_ATTR_PREFETCH_ROWS = 0` and `OCI_ATTR_PREFETCH_MEMORY = 0`, one define per column (array of `rows_per_fetch` values, indicators `sb2`, lengths `ub4` through `OCIDefineByPos2`), LOB columns as locator arrays with LOB prefetch, `OCIStmtExecute(iters = 0)`, then `OCIStmtFetch2(rows_per_fetch)` with the row count from `OCI_ATTR_ROWS_FETCHED` (rows may come with `OCI_NO_DATA`). Add the file to `OCI_SRCS` and `EXTENSION_SOURCES`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -551,14 +558,18 @@ git commit -m "Add the array fetch cursor with byte-sized prefetching and inline
 Behaviour:
 - Snapshot: `kNone` → no SCN. Otherwise read the SCN and check it with `SELECT 1 FROM <object> AS OF SCN TO_NUMBER(:b1) WHERE ROWNUM < 1`; on failure `kScn` throws `OracleError` with Oracle's message, `kAuto` leaves `scn` empty and adds a note.
 - `sessions == 1` → `kNone`, one slice, no dictionary query.
-- `kExtents` (or first step of `kAuto` for tables): segments and extents from `DBA_EXTENTS` joined to `ALL_OBJECTS` (`data_object_id`, matching `subobject_name` to `partition_name`, segment types `TABLE`, `TABLE PARTITION`, `TABLE SUBPARTITION`), or from `USER_EXTENTS`/`USER_OBJECTS` when `owned_by_session_user`; slices from `BuildRowidSlices(extents, TargetBlocks(total, sessions))`. No extents → zero slices (empty table). Failure: `kExtents` throws `OraduckError("split 'extents' needs read access to DBA_EXTENTS or ownership of the table: …")`; `kAuto` notes and goes on.
+- `kExtents` (or first step of `kAuto` for tables), two sources tried in order:
+  1. `DBA_EXTENTS` joined to `ALL_OBJECTS` (`data_object_id`, matching `subobject_name` to `partition_name`, segment types `TABLE`, `TABLE PARTITION`, `TABLE SUBPARTITION`) → `BuildRowidSlices(extents, TargetBlocks(largest, sessions))`, `largest` = the most blocks of one data object;
+  2. on ORA-00942/ORA-01031: `DBMS_PARALLEL_EXECUTE.CREATE_TASK` (name `ORADUCK_` + 16 random hex characters), `CREATE_CHUNKS_BY_ROWID(task, owner, table, by_row => FALSE, chunk_size => TargetBlocks(largest, sessions))` with `largest` = the largest `BLOCKS` statistic of `ALL_TAB_SUBPARTITIONS`, else `ALL_TAB_PARTITIONS`, else `ALL_TABLES` (1,024 when no statistics), read the chunks from `USER_PARALLEL_EXECUTE_CHUNKS` as `hi_inclusive` slices, then `DROP_TASK` — also when anything fails after `CREATE_TASK`. These calls commit in Oracle (the planning session only). `USER_EXTENTS` is not used: it has no block address (probe R5).
+  No extents → zero slices (empty table). Both sources failing: `kExtents` throws `OraduckError("split 'extents' needs DBA_EXTENTS or DBMS_PARALLEL_EXECUTE: …")` with both Oracle messages; `kAuto` notes and goes on. Views skip `kExtents`.
 - `kHash` (second step of `kAuto`, first step for views): check `SELECT 1 FROM <object> WHERE ORA_HASH(ROWID, 1) = 0 AND ROWNUM < 1`; slices: `sessions` buckets. Failure (ORA-01445 on a join view): `kHash` throws, `kAuto` goes to `kNone`.
 - `kNone`: one slice.
 - The plan is computed once per query execution (the glue calls it from its global init), never cached in bind data: ROWID ranges go stale after `TRUNCATE` or new partitions.
 
 - [ ] **Step 1: Write the failing integration tests**, on a LIST-partitioned (`PART_DATE` DATE) and LIST-subpartitioned (`SUB_KEY` VARCHAR2(8)) table of 300,000 rows with a unique `ID`, created once in the bigfile `BENCH` tablespace and once in `BENCH_SMALL`:
   - for `kExtents`, `kHash` and `kNone` with 4 sessions: reading every slice with a `FetchCursor` on `SELECT ID` gives 300,000 rows, 300,000 distinct IDs and the same `SUM(ID)` as Oracle;
-  - `kAuto` for `BENCH` (owner) → `kExtents`; for `READER` (granted `SELECT` only) → `kHash` with a note naming the extents error; forced `kExtents` for `READER` → throws;
+  - grant `SELECT ON SYS.DBA_EXTENTS` to `BENCH` in `infra/oracle/setup/02_read.sh` (re-run `./infra/oracle/grants.sh`): `kAuto` for `BENCH` → `kExtents` from `DBA_EXTENTS`; for `READER` (granted `SELECT` on the table only) → `kExtents` through `DBMS_PARALLEL_EXECUTE` (the note names the source), and no `ORADUCK_%` task is left in `USER_PARALLEL_EXECUTE_TASKS` afterwards;
+  - unit sizing: on the subpartitioned table, the units of the largest subpartition number at least `4 × sessions` with both sources;
   - a simple view → `kHash`; a join view → `kNone` under `kAuto`, throws under `kHash`;
   - an empty table (deferred segment) under `kExtents` → zero slices;
   - snapshot: `BENCH` gets a non-empty SCN; `READER` with `kAuto` gets `""` and a note, with `kScn` throws;
@@ -598,6 +609,8 @@ git commit -m "Plan parallel reads: ROWID extents, ROWID hash or a single sessio
   - `struct ScanOptions { uint32_t sessions = 0; oraduck::SplitStrategy split = oraduck::SplitStrategy::kAuto; oraduck::UnconstrainedNumber unconstrained; oraduck::SnapshotMode snapshot = oraduck::SnapshotMode::kAuto; };` (`sessions == 0` → the number of DuckDB threads)
   - `void RegisterOraduckScan(ExtensionLoader &loader);`
   - `TableFunction GetOraduckScanFunction();`
+  - `void ApplyScanOption(ScanOptions &options, const string &name, const Value &value);` validates one option by name (`sessions`, `split`, `unconstrained_number`, `snapshot`, case-insensitive) and throws `InvalidInputException` naming the accepted values; used for the named parameters here and for the `ATTACH` options in Task 10b.
+  - `vector<string> DuckColumnNames(const oraduck::OracleTableDescription &source);` the deduplicated DuckDB names (used by Task 10b's table entries).
   - `unique_ptr<FunctionData> BindOraduckScan(ClientContext &context, oraduck::OracleCredentials credentials, oraduck::OracleTableDescription source, const ScanOptions &options, vector<LogicalType> &return_types, vector<Identifier> &names);` the seam a future `ATTACH` uses.
   - `struct OraduckScanBindData : public TableFunctionData` with `credentials`, `source`, `std::vector<oraduck::ReadColumnPlan> columns` (one per Oracle column), `options`, `std::vector<oraduck::SqlFragment> filters` (filled by Task 10).
   - In `scan_vectors.hpp`: `LogicalType ToLogicalType(const oraduck::DuckTypeSpec &spec);` and `void WriteColumn(const oraduck::FetchCursor &cursor, size_t cursor_column, const oraduck::ReadColumnPlan &plan, uint32_t first_row, uint32_t count, Vector &out, idx_t out_offset);` (decodes `count` rows of the batch into `out` at `out_offset`; decoder errors → `IOException` naming the column).
@@ -647,7 +660,7 @@ End-to-end tests (all values compared as `CAST(col AS VARCHAR)` or `strftime`):
 - `test_scan_types.py::test_unsupported_column_only_when_selected` — table with an `XMLTYPE` column: `SELECT id …` works, `SELECT *` fails naming the column and `XMLTYPE`.
 - `test_scan_types.py::test_projection_pushdown` — `EXPLAIN ANALYZE SELECT a FROM oraduck_scan(…)` shows `Oracle SQL` selecting only `"A"`.
 - `test_scan_parallel.py::test_split_strategies_agree` — 1,000,000 rows, `SET threads = 8`: `count(*)`, `sum(id)`, `count(DISTINCT id)` identical for `split := 'extents'`, `'hash'`, `'none'`, and equal to Oracle's; EXPLAIN ANALYZE shows the forced strategy and, for extents, `Units` ≥ 8.
-- `test_scan_parallel.py::test_reader_falls_back_to_hash` — secret with `READER`: `Strategy` = `hash` and a note; `Snapshot` = `per session`.
+- `test_scan_parallel.py::test_reader_uses_parallel_execute_chunks` — secret with `READER`: `Strategy` = `extents`, a note naming `DBMS_PARALLEL_EXECUTE`, correct `count(*)`/`sum(id)`; `Snapshot` = `per session`; on a simple view, `Strategy` = `hash`.
 - `test_scan_parallel.py::test_two_scans_in_one_query` — self-join on `id` of the same table through two `oraduck_scan` calls returns 1,000,000 rows (Review Focus 4).
 - `test_scan_parallel.py::test_nothing_to_read` — empty table (`count(*)` = 0, `SELECT *` returns no rows with the right column names), `count(*)` on 1,000,000 rows = 1,000,000 (Review Focus 5).
 - `test_scan_parallel.py::test_prepared_statement_after_truncate` — `PREPARE q AS SELECT count(*) FROM oraduck_scan(…)`; `EXECUTE q` → n; Oracle `TRUNCATE` + insert m rows; `EXECUTE q` → m.
@@ -720,6 +733,64 @@ git commit -m "Push DuckDB filters down to Oracle for partition pruning"
 
 ---
 
+### Task 10b: Read-only `ATTACH … (TYPE oraduck)`
+
+**Files:**
+- Create: `src/include/oraduck_catalog.hpp`, `src/oraduck_catalog.cpp` (catalog, storage extension, transaction manager), `src/oraduck_catalog_entries.cpp` (schema and table entries)
+- Modify: `src/include/oraduck/describe_source.hpp`, `src/describe_source.cpp` (bulk description of one schema), `src/oraduck_extension.cpp` (register), `CMakeLists.txt`
+- Test: `test/cpp/itest_describe_source.cpp`, `test/sql/oraduck_attach.test`, `tests/e2e/test_attach.py`
+
+**Interfaces:**
+- Consumes: `DescribeSource`, `PrepareReadSession`, `OracleTableDescription` (Task 6), `PlanReadColumn` and `ToLogicalType` (Tasks 4, 9), `ScanOptions`, `ApplyScanOption`, `DuckColumnNames`, `BindOraduckScan`, `GetOraduckScanFunction` (Task 9), `GetOraduckCredentials`.
+- Produces:
+  - `std::vector<OracleTableDescription> DescribeSchema(OciSession &session, const std::string &owner);` every table and view of `owner` in two dictionary queries (objects, then `ALL_TAB_COLUMNS` for the owner ordered by `table_name, column_id`), plus `ALL_TABLES` statistics; same fields as `DescribeSource`.
+  - `void RegisterOraduckStorage(ExtensionLoader &loader);` registers the storage extension `oraduck` (`StorageExtension::Register(DBConfig::GetConfig(loader.GetDatabaseInstance()), "oraduck", …)`).
+  - `class OraduckCatalog : public Catalog` (credentials, `ScanOptions` from the `ATTACH` options, default schema = `SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')` read once at attach, schema entries cached under a mutex); `GetCatalogType()` = `"oraduck"`; `GetDefaultSchema()` = the current schema.
+  - `class OraduckSchemaEntry : public SchemaCatalogEntry` (table entries cached; one lookup describes one object with `DescribeSource`, a `TABLE_ENTRY` scan describes the whole schema with `DescribeSchema` once).
+  - `class OraduckTableEntry : public TableCatalogEntry` built from an `OracleTableDescription`: columns named by `DuckColumnNames` with the types of `PlanReadColumn(…, options.unconstrained, db_charset)`; `GetScanFunction` sets `bind_data = BindOraduckScan(context, credentials, description, options, …)` and returns `GetOraduckScanFunction()`; `GetStatistics` returns `nullptr`.
+  - `class OraduckTransactionManager : public TransactionManager` and its transaction: no-op begin/commit/rollback/checkpoint (every scan opens its own sessions).
+
+Behaviour (spec 4.7):
+- `ATTACH '' AS ora (TYPE oraduck, SECRET <name> [, SESSIONS n] [, SPLIT …] [, SNAPSHOT …] [, UNCONSTRAINED_NUMBER …])`: `SECRET` required (`BinderException("OraDuck: ATTACH needs SECRET (name of an oraduck secret)")`); a non-empty path → `BinderException("OraDuck: the ATTACH path must be empty; the connection comes from SECRET")`; other options through `ApplyScanOption` (unknown option → error naming the accepted ones); one connection at attach checks the credentials and reads the current schema.
+- Name resolution for schemas and tables: exact match first, then the upper-cased name (Oracle unquoted names); schemas checked against `ALL_USERS`; `ScanSchemas` lists `ALL_USERS`; a table lookup resolves tables, views and synonyms (`DescribeSource`); a schema scan lists tables and views (`DescribeSchema`).
+- Read-only: `CreateSchema`, `DropSchema`, the schema entry's `Create*`, `DropEntry`, `Alter`, and the catalog's `PlanInsert`, `PlanCreateTableAs`, `PlanDelete`, `PlanUpdate`, `PlanMergeInto`, `BindCreateIndex` throw `PermissionException("OraDuck: attached Oracle databases are read-only; load data with COPY … TO '<SCHEMA.TABLE>' (FORMAT ORADUCK, CONNECTION '<secret>')")`.
+- Descriptions stay cached until `DETACH`.
+
+- [ ] **Step 1: Write the failing tests**
+  - `itest_describe_source.cpp`: `DescribeSchema(session, "BENCH")` returns the test tables and views created by the test with the same columns as `DescribeSource` on each.
+  - `test/sql/oraduck_attach.test` (no Oracle): `ATTACH '' AS ora (TYPE oraduck)` → error with `SECRET`; `ATTACH 'x' AS ora (TYPE oraduck, SECRET s)` → error with `path must be empty`; `ATTACH '' AS ora (TYPE oraduck, SECRET absent)` → error with `not found`; `ATTACH '' AS ora (TYPE oraduck, SECRET absent, SPLIT 'random')` → error naming `auto`, `extents`, `hash`, `none`.
+  - `tests/e2e/test_attach.py` (helpers `attach_sql()` next to `secret_sql()`):
+    - `test_default_schema_and_names` — `SELECT count(*) FROM ora.BENCH.<t>`, `FROM ora.<t>`, `FROM ora.bench.<t lower-case>`, and after `USE ora.BENCH`, `FROM <t>`: same count as Oracle.
+    - `test_show_tables_and_columns` — `SHOW TABLES FROM ora.BENCH` contains the test table and view; `information_schema.columns` gives the DuckDB types of spec 5.3 for a table with every type (e.g. `NUMBER(25,9)` → `DECIMAL(25,9)`, `DATE` → `TIMESTAMP`, `CLOB` → `VARCHAR`).
+    - `test_view_and_synonym` — a view and a private synonym read through `ora.BENCH.<name>` give Oracle's rows.
+    - `test_pushdown_through_attach` — `EXPLAIN SELECT * FROM ora.BENCH.<partitioned> WHERE part_date = DATE '2024-05-07'` shows `Oracle WHERE` `("PART_DATE" = DATE '2024-05-07')` and no DuckDB `FILTER`; the `V$SEGMENT_STATISTICS` check of Task 10 shows only the target partition read; `EXPLAIN ANALYZE SELECT a FROM ora.BENCH.<t>` shows an `Oracle SQL` selecting only `"A"`.
+    - `test_attach_options` — `ATTACH … (TYPE oraduck, SECRET ora, SPLIT 'none')`: `Strategy` = `none`; `SESSIONS 2`: `Sessions` ≤ 2; `UNCONSTRAINED_NUMBER 'VARCHAR'`: an unconstrained `NUMBER` column has type `VARCHAR`.
+    - `test_two_attached_databases` — `ora` (BENCH) and `rd` (READER) attached; a join between `ora.BENCH.<t>` and `rd.BENCH.<t>` on `id` returns every row.
+    - `test_refresh_by_detach` — a column added in Oracle after the first query is absent until `DETACH ora; ATTACH …`, then present.
+    - `test_read_only` — `INSERT INTO ora.BENCH.<t> VALUES (…)`, `CREATE TABLE ora.BENCH.x (i INTEGER)`, `DROP TABLE ora.BENCH.<t>`, `DELETE FROM ora.BENCH.<t>` each fail with `read-only` and `COPY`; the Oracle table is unchanged.
+    - `test_missing_table_and_unsupported_column` — `SELECT * FROM ora.BENCH.nope` fails with DuckDB's missing-table error; on a table with an `XMLTYPE` column, `SELECT id` works and `SELECT *` fails naming the column.
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `GEN=ninja make release && make test && source env.sh && make itest && uv run pytest tests/e2e/test_attach.py -q`
+Expected: `oraduck_attach.test` and `test_attach.py` fail (no storage extension `oraduck`); the itest fails to compile (`DescribeSchema` missing).
+
+- [ ] **Step 3: Implement `DescribeSchema`, the catalog classes and the registration; add the new files to `EXTENSION_SOURCES` (and `describe_source.cpp` stays in `OCI_SRCS`).**
+
+- [ ] **Step 4: Run all tests**
+
+Run: `GEN=ninja make release && make test && make unit && source env.sh && make itest && uv run pytest tests/e2e -q`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/include/oraduck_catalog.hpp src/oraduck_catalog.cpp src/oraduck_catalog_entries.cpp src/include/oraduck/describe_source.hpp src/describe_source.cpp src/oraduck_extension.cpp CMakeLists.txt test/cpp/itest_describe_source.cpp test/sql/oraduck_attach.test tests/e2e/test_attach.py tests/e2e/oraduck_helpers.py
+git commit -m "Add read-only ATTACH of Oracle databases"
+```
+
+---
+
 ### Task 11: Read benchmark harness: data, OraDuck method, protocol, read-only mode
 
 **Files:**
@@ -733,11 +804,11 @@ git commit -m "Push DuckDB filters down to Oracle for partition pruning"
   - `read_config.py`: `READ_CASES = ((1_000_000, 50), (1_000_000, 550), (7_000_000, 50), (7_000_000, 550))`, `TARGET_DATE = "2024-05-07"`, `READ_RUNS = 5`, `READ_COMPETITOR_RUNS = 3`, `READ_TIMEOUT_S = 15 * 60`, `READ_OUT_DB = WORK / "read_out.duckdb"`.
   - `read_schema.py`: `read_table_name(nrows: int, ncols: int) -> str` (`RD_<rows>_<cols>`); `read_columns(ncols: int) -> list[ColumnSpec]`: first `PART_DATE DATE`, `SUB_KEY VARCHAR2(8)`, `ID NUMBER(38,0)`, then a cycle of `VARCHAR2(4000 BYTE)` ×3 (5–30 characters), `NUMBER(38,0)` ×2, `NUMBER(25,9)` ×2, `DATE`, `CHAR(1 BYTE)`, `TIMESTAMP(6)`, unconstrained `NUMBER`; one `CLOB` column per 250 columns (at least 1); `read_oracle_ddl(nrows, ncols) -> str` (LIST partitions 2024-05-06, 2024-05-07, 2024-05-08, DEFAULT; subpartition template LIST on `SUB_KEY` `'A'`, `'B'`, DEFAULT); `READ_CHECKSUM_DUCK` / `READ_CHECKSUM_ORACLE` (rows, `SUM(ID)`, `SUM(LENGTH(V1))`, NULL count of `D1` (first `NUMBER(25,9)`), `SUM(LENGTH(CLOB1))`, all over the target partition).
   - `read_data.py`: `ensure_read_table(cfg, nrows, ncols) -> str` (idempotent: keeps a table whose target-partition row count is right): Fakelake → Parquet → OraDuck `COPY` into the partitioned table (`nrows` rows in the target partition, `nrows // 20` in each other dated partition), CLOBs filled server-side for 2 % of the rows (*Claude's call*: values of 100–3,000 characters, one row in five of them 20,000 characters), `DBMS_STATS.GATHER_TABLE_STATS`.
-  - `read_methods.py`: `Measurement` fields `method, table, nrows, ncols, threads, total_s, link_bytes: int | None, extra: dict`; `oraduck_sql(cfg, table, threads, where) -> tuple[str, str]` (setup, timed `CREATE TABLE t AS SELECT * FROM oraduck_scan('BENCH.<table>', connection := 'bench') WHERE <where>`); `run_oraduck(cfg, table, threads, where) -> Measurement` into `READ_OUT_DB` (deleted before each run).
+  - `read_methods.py`: `Measurement` fields `method, table, nrows, ncols, threads, total_s, link_bytes: int | None, extra: dict`; `oraduck_sql(cfg, table, threads, where, via="attach") -> tuple[str, str]` (setup with `ATTACH '' AS ora (TYPE oraduck, SECRET bench)`, timed `CREATE TABLE t AS SELECT * FROM ora.BENCH.<table> WHERE <where>`; `via="scan"` times `… FROM oraduck_scan('BENCH.<table>', connection := 'bench') WHERE <where>` instead); `run_oraduck(cfg, table, threads, where, via="attach") -> Measurement` into `READ_OUT_DB` (deleted before each run); method names `oraduck` (ATTACH) and `oraduck_scan`.
   - `read_runner.py`: `run_read_case(cfg, nrows, ncols, methods, runs, out, where=None)` (warm-up, interleaved runs, checksums after every run against Oracle's on the same predicate, mismatch → `ChecksumMismatch`, timeout skip rule of `competitors.should_skip`, JSONL records with suite name).
-  - CLI subcommands: `read-smoke` (1M × 50, OraDuck, 1 run), `read-matrix` (all `READ_CASES`, OraDuck N = 8), `read-external --dsn DSN --user USER --table OWNER.TABLE --where SQL [--runs N]` (no data generation, password from `ORADUCK_EXTERNAL_PASSWORD`, OraDuck only, prints the median and rows/s and MB/s of DuckDB storage).
+  - CLI subcommands: `read-smoke` (1M × 50, OraDuck, 1 run), `read-matrix` (all `READ_CASES`, OraDuck N = 8 through `ATTACH`, plus `oraduck_scan` on 1M × 550), `read-external --dsn DSN --user USER --table OWNER.TABLE --where SQL [--runs N]` (no data generation, password from `ORADUCK_EXTERNAL_PASSWORD`, OraDuck only, prints the median and rows/s and MB/s of DuckDB storage).
 
-- [ ] **Step 1: Write the failing tests** (no Oracle): `read_columns(550)` has 550 columns, starts with `PART_DATE`, `SUB_KEY`, `ID`, has 2 CLOBs; `read_columns(50)` has 1 CLOB; `read_oracle_ddl` contains `PARTITION BY LIST ("PART_DATE")` and `SUBPARTITION TEMPLATE`; `oraduck_sql` contains `oraduck_scan('BENCH.RD_1000000_50', connection := 'bench')` and `SET threads = 8;`; the runner interleaves methods (`["oraduck", "x", "oraduck", "x"]` after the warm-up) and raises `ChecksumMismatch` on differing checksums (fakes for the method and checksum functions, as in `tests/bench/test_runner.py`).
+- [ ] **Step 1: Write the failing tests** (no Oracle): `read_columns(550)` has 550 columns, starts with `PART_DATE`, `SUB_KEY`, `ID`, has 2 CLOBs; `read_columns(50)` has 1 CLOB; `read_oracle_ddl` contains `PARTITION BY LIST ("PART_DATE")` and `SUBPARTITION TEMPLATE`; `oraduck_sql` contains `ATTACH '' AS ora (TYPE oraduck, SECRET bench)`, `FROM ora.BENCH.RD_1000000_50` and `SET threads = 8;`, and with `via="scan"` contains `oraduck_scan('BENCH.RD_1000000_50', connection := 'bench')`; the runner interleaves methods (`["oraduck", "x", "oraduck", "x"]` after the warm-up) and raises `ChecksumMismatch` on differing checksums (fakes for the method and checksum functions, as in `tests/bench/test_runner.py`).
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -855,7 +926,7 @@ Expected: all checksums OK; `bench/REPORT_READ.md` generated.
 
 - [ ] **Step 2: Write the analysis** in `bench/REPORT_READ.md` (as measured, including where OraDuck does not win; state the DuckDB version each competitor ran in, the Oracle 19.3 / local-container limits, and whether the spec 10.5 criteria are met).
 
-- [ ] **Step 3: Update the docs**: README section "Read from Oracle" (view approach, `oraduck_scan` parameters, type mapping table, write constants in the column's type, network options in the DSN with the Advanced Compression licence note, `EXPLAIN` / `EXPLAIN ANALYZE` output, benchmark summary linking `bench/REPORT_READ.md`, the note that each DuckDB release needs a matching OraDuck build); `docs/design.md`: scope (reading is now in scope), components table and a "Read path" section linking the spec.
+- [ ] **Step 3: Update the docs**: README section "Read from Oracle" (`ATTACH` first — options, default schema, read-only, refresh by `DETACH`/`ATTACH` —, then the view approach, `oraduck_scan` parameters, the temporary `DBMS_PARALLEL_EXECUTE` task, type mapping table, write constants in the column's type, network options in the DSN with the Advanced Compression licence note, `EXPLAIN` / `EXPLAIN ANALYZE` output, benchmark summary linking `bench/REPORT_READ.md`, the note that each DuckDB release needs a matching OraDuck build); `docs/design.md`: scope (reading is now in scope), components table and a "Read path" section linking the spec.
 
 - [ ] **Step 4: Full verification**
 
