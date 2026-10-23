@@ -95,9 +95,13 @@ def _yaml_scalar(value) -> str:
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def fakelake_yaml(ncols: int, nrows: int, output_name: str, seed: int = SEED) -> str:
+def fakelake_yaml(ncols: int, nrows: int, output_name: str, seed: int = SEED,
+                  cols: list[ColumnSpec] | None = None) -> str:
+    """Fakelake configuration; columns without Fakelake parameters are computed at load time."""
     lines = ["columns:"]
-    for col in columns(ncols):
+    for col in cols if cols is not None else columns(ncols):
+        if not col.fakelake:
+            continue
         lines.append(f"  - name: {col.name}")
         for key, value in col.fakelake.items():
             if isinstance(value, list):

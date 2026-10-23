@@ -14,6 +14,14 @@ from .config import DUCKDB_CLI, WORK
 _TIMER = re.compile(r"Run Time \(s\): real (\d+(?:\.\d+)?)")
 
 
+# The CLI prints WARNING log entries on stdout (colored), in the middle of a result
+_WARNING = re.compile(r"(?:\x1b\[[0-9;]*m)*WARNING:\n(?:\x1b\[[0-9;]*m)*(.*?)\n\n(?:\x1b\[[0-9;]*m)*", re.DOTALL)
+
+
+def strip_warnings(stdout: str) -> str:
+    return _WARNING.sub("", stdout)
+
+
 class DuckDBError(RuntimeError):
     pass
 
@@ -24,7 +32,7 @@ class MethodTimeout(DuckDBError):
 
 def run(sql: str, db: Path | str = ":memory:", csv_output: bool = False, timeout_s: float | None = None,
         unsigned: bool = False) -> str:
-    args = [str(DUCKDB_CLI), "-batch", "-bail"]
+    args = [str(DUCKDB_CLI), "-batch", "-bail", "-no-agent"]
     if csv_output:
         args += ["-csv", "-noheader"]
     if unsigned:
@@ -37,7 +45,7 @@ def run(sql: str, db: Path | str = ":memory:", csv_output: bool = False, timeout
         raise MethodTimeout(f"duckdb killed after {timeout_s} s") from exc
     if proc.returncode != 0:
         raise DuckDBError(f"duckdb failed ({proc.returncode}):\n{proc.stderr.strip()}\n--- script ---\n{sql[:2000]}")
-    return proc.stdout
+    return strip_warnings(proc.stdout)
 
 
 def query(sql: str, db: Path | str, unsigned: bool = False) -> list[list[str]]:
