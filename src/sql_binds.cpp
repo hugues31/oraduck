@@ -92,6 +92,24 @@ BindValue BindText(const std::string &value) {
 	return bind;
 }
 
+// A 4-byte length then the bytes: unlike SQLT_CHR, whose input values lose their trailing blanks, the value reaches
+// Oracle unchanged and compares with non-padded semantics (as VARCHAR2 up to 4,000 bytes)
+BindValue BindVarchar(const std::string &value) {
+	if (value.size() > static_cast<size_t>(INT32_MAX) - sizeof(int32_t)) {
+		throw OraduckError("text too long for a bind");
+	}
+	BindValue bind;
+	bind.dty = SQLT_LVC;
+	const int32_t length = static_cast<int32_t>(value.size());
+	bind.bytes.resize(sizeof(length) + value.size());
+	std::memcpy(bind.bytes.data(), &length, sizeof(length));
+	if (!value.empty()) {
+		std::memcpy(bind.bytes.data() + sizeof(length), value.data(), value.size());
+	}
+	bind.display = SqlStringLiteral(value);
+	return bind;
+}
+
 BindValue BindDate(int64_t micros) {
 	int64_t days, micros_of_day;
 	SplitMicros(micros, days, micros_of_day);

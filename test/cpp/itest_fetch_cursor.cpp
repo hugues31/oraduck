@@ -823,6 +823,34 @@ TEST_CASE("Fetch cursor: binds of every type and hash slices", "[oracle][fetch_c
 	CHECK(slice_sum == 500500);
 }
 
+TEST_CASE("Fetch cursor: varchar binds keep their trailing blanks", "[oracle][fetch_cursor]") {
+	OciSession session(TestCredentials());
+	DropGuard guard {session, {"ITEST_FC_BLANKS"}};
+	guard.DropAll();
+	session.Execute("CREATE TABLE ITEST_FC_BLANKS (ID NUMBER(10), V VARCHAR2(10), C CHAR(3), NV NVARCHAR2(10))");
+	session.Execute("INSERT INTO ITEST_FC_BLANKS VALUES (1, 'abc ', 'A', 'n ')");
+	session.Execute("INSERT INTO ITEST_FC_BLANKS VALUES (2, 'abc', 'AB', 'n')");
+	ReadPlan plan(session, "ITEST_FC_BLANKS");
+	const std::vector<const ReadColumnPlan *> id_only = {&plan.plans[0]};
+	auto ids = [&](const std::string &where, const std::string &text) {
+		SqlStatement statement;
+		statement.sql = "SELECT ID FROM ITEST_FC_BLANKS WHERE " + where + " = :b1 ORDER BY ID";
+		statement.binds = {BindVarchar(text)};
+		FetchCursor cursor(session, statement, id_only, FetchOptions());
+		std::vector<int64_t> result;
+		for (const auto &row : ReadAll(cursor, 1)) {
+			result.push_back(Int64(row[0].bytes));
+		}
+		return result;
+	};
+	// Non-padded comparison of the exact value (SQLT_CHR would strip the blanks: 'abc ' would find row 2)
+	CHECK(ids("V", "abc ") == std::vector<int64_t> {1});
+	CHECK(ids("V", "abc") == std::vector<int64_t> {2});
+	CHECK(ids("C", "A  ") == std::vector<int64_t> {1});
+	CHECK(ids("C", "A").empty());
+	CHECK(ids("NV", "n ") == std::vector<int64_t> {1});
+}
+
 TEST_CASE("Fetch cursor: round trips with 5 small CLOB columns", "[oracle][fetch_cursor][lob]") {
 	OciSession session(TestCredentials());
 	DropGuard guard {session, {"ITEST_FC_LOBS"}};

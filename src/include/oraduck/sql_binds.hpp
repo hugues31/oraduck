@@ -31,7 +31,8 @@ struct SqlStatement {
 // All throw OraduckError when the value cannot be represented.
 BindValue BindNumber(int64_t value);                                 // SQLT_NUM
 BindValue BindDecimal(const OracleInt128 &value, uint8_t scale);     // SQLT_NUM, value * 10^-scale
-BindValue BindText(const std::string &value);                        // SQLT_CHR
+BindValue BindText(const std::string &value);                        // SQLT_CHR: Oracle strips trailing blanks
+BindValue BindVarchar(const std::string &value);                     // SQLT_LVC: kept as is (filter constants)
 BindValue BindDate(int64_t micros);                                  // SQLT_DAT (7 bytes), fractional seconds truncated
 BindValue BindDouble(double value);                                  // SQLT_BDOUBLE
 

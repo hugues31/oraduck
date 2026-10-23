@@ -164,7 +164,8 @@ struct Builder {
 			if (!utf8 && !IsAscii(k.text)) {
 				return false;
 			}
-			AddBind(BindText(k.text), sql, display);
+			// Not BindText: the trailing blanks of the constant matter (non-padded comparison)
+			AddBind(BindVarchar(k.text), sql, display);
 			return true;
 		default:
 			return false;

@@ -4,6 +4,7 @@
 #include "oraduck/oracle_encoding.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 using namespace oraduck;
@@ -188,7 +189,7 @@ TEST_CASE("VARCHAR2 IN list and ranges", "[filter_sql]") {
 	REQUIRE(f);
 	CHECK(f->sql == "(\"SUB_KEY\" IN (:b1, :b2))");
 	CHECK(f->display == "(\"SUB_KEY\" IN ('A', 'B'))");
-	CHECK(f->binds[0].dty == SQLT_CHR);
+	CHECK(f->binds[0].dty == SQLT_LVC);
 	CHECK(Translate(Leaf(FilterOp::kGt, 1, {Text("A")})));
 	CHECK(Translate(Leaf(FilterOp::kEq, 1, {Text("it's")}))->display == "(\"SUB_KEY\" = 'it''s')");
 }
@@ -213,7 +214,23 @@ TEST_CASE("The empty string is not pushed", "[filter_sql]") {
 TEST_CASE("CHAR comparisons use a character bind", "[filter_sql]") {
 	auto f = Translate(Leaf(FilterOp::kEq, 4, {Text("Y")}));
 	REQUIRE(f);
-	CHECK(f->binds[0].dty == SQLT_CHR);
+	CHECK(f->binds[0].dty == SQLT_LVC);
+}
+
+TEST_CASE("String constants keep their trailing blanks", "[filter_sql]") {
+	// SQLT_CHR would lose them: 'A  ' would compare as 'A' (LONG VARCHAR: 4-byte length, then the bytes)
+	for (size_t column : {1, 4, 12}) {
+		auto f = Translate(Leaf(FilterOp::kEq, column, {Text("A  ")}));
+		REQUIRE(f);
+		REQUIRE(f->binds.size() == 1);
+		CHECK(f->binds[0].dty == SQLT_LVC);
+		const int32_t length = 3;
+		std::vector<uint8_t> expected(sizeof(length));
+		std::memcpy(expected.data(), &length, sizeof(length));
+		expected.insert(expected.end(), {'A', ' ', ' '});
+		CHECK(f->binds[0].bytes == expected);
+		CHECK(f->display.find("'A  '") != std::string::npos);
+	}
 }
 
 TEST_CASE("NUMBER with precision binds a NUMBER", "[filter_sql]") {

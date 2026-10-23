@@ -1,4 +1,5 @@
 #include "oraduck_scan.hpp"
+#include "oraduck_scan_filters.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp"
@@ -483,6 +484,8 @@ TableFunction GetOraduckScanFunction() {
 		    .Add("snapshot", LogicalType::VARCHAR);
 	});
 	function.projection_pushdown = true;
+	// Filters that translate into Oracle SQL go to the Oracle WHERE (partition pruning), the others stay in DuckDB
+	function.pushdown_complex_filter = OraduckScanPushdownComplexFilter;
 	function.filter_pushdown = false;
 	function.filter_prune = false;
 	// Units are read in parallel: the scan does not keep Oracle's row order

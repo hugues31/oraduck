@@ -34,6 +34,7 @@ set(EXTENSION_SOURCES
     src/work_units.cpp
     src/oraduck_copy.cpp
     src/oraduck_scan.cpp
+    src/oraduck_scan_filters.cpp
     src/scan_vectors.cpp
     src/column_plan.cpp
     src/chunk_writer.cpp)
