@@ -28,6 +28,7 @@ set(EXTENSION_SOURCES
     src/oci.cpp
     src/oci_session.cpp
     src/describe_target.cpp
+    src/describe_source.cpp
     src/direct_path_loader.cpp
     src/oraduck_copy.cpp
     src/column_plan.cpp
