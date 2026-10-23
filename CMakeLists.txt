@@ -20,6 +20,10 @@ set(EXTENSION_SOURCES
     src/oracle_decoding.cpp
     src/oracle_names.cpp
     src/read_types.cpp
+    src/sql_binds.cpp
+    src/filter_sql.cpp
+    src/read_sql.cpp
+    src/rowid_ranges.cpp
     src/oci_api.cpp
     src/oci.cpp
     src/oci_session.cpp

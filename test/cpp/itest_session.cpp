@@ -1,5 +1,6 @@
 #include "catch.hpp"
 #include "oraduck/describe_target.hpp"
+#include "oraduck/rowid_ranges.hpp"
 #include "itest_support.hpp"
 
 using namespace oraduck;
@@ -71,4 +72,36 @@ TEST_CASE("The test database has the read-path privileges", "[session]") {
 	OciSession reader(ReaderCredentials());
 	CHECK_THROWS_WITH(reader.QueryStrings("SELECT COUNT(*) FROM dba_extents WHERE ROWNUM = 1"),
 	                  Catch::Contains("ORA-00942"));
+}
+
+TEST_CASE("EncodeRowid matches Oracle", "[oracle][rowid]") {
+	OciSession session(TestCredentials());
+	const uint32_t objects[] = {1, 73512, 4294967295u};
+	const uint32_t files[] = {1, 4, 1023};
+	const uint32_t blocks[] = {0, 1, 12345, 0x3FFFFF};
+	const uint16_t rows[] = {0, 7, 4095};
+	for (auto o : objects) {
+		for (auto f : files) {
+			for (auto b : blocks) {
+				for (auto r : rows) {
+					const auto expected = Scalar(session, "SELECT ROWIDTOCHAR(DBMS_ROWID.ROWID_CREATE(1, " + std::to_string(o) +
+					                                          ", " + std::to_string(f) + ", " + std::to_string(b) +
+					                                          ", " + std::to_string(r) + ")) FROM dual");
+					CHECK(EncodeRowid(o, f, b, r) == expected);
+				}
+			}
+		}
+	}
+
+	// Bigfile tablespace: one file, the block number spans 32 bits
+	DropTableIfExists(session, "ITEST_ROWID");
+	session.Execute("CREATE TABLE ITEST_ROWID (ID NUMBER(5)) TABLESPACE BENCH");
+	session.Execute("INSERT INTO ITEST_ROWID VALUES (1)");
+	const auto row = session.QueryStrings("SELECT ROWIDTOCHAR(ROWID), DBMS_ROWID.ROWID_OBJECT(ROWID), "
+	                                      "DBMS_ROWID.ROWID_BLOCK_NUMBER(ROWID, 'BIGFILE'), "
+	                                      "DBMS_ROWID.ROWID_ROW_NUMBER(ROWID) FROM ITEST_ROWID")
+	                 .at(0);
+	CHECK(EncodeRowid(static_cast<uint32_t>(std::stoul(row[1])), 1024, static_cast<uint32_t>(std::stoul(row[2])),
+	                  static_cast<uint16_t>(std::stoul(row[3]))) == row[0]);
+	DropTableIfExists(session, "ITEST_ROWID");
 }
