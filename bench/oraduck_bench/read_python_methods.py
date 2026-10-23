@@ -11,17 +11,17 @@ import os
 import sys
 import time
 
-RESULT_PREFIX = "ORADUCK_BENCH_RESULT "
-BATCH_SIZE = 100_000
+from .config import OracleConfig
+from .read_config import PYTHON_BATCH_SIZE as BATCH_SIZE
+from .read_methods import RESULT_PREFIX, connectorx_url, python_sql
 
 
 def result_line(result: dict) -> str:
     return RESULT_PREFIX + json.dumps(result)
 
 
-def _credentials() -> tuple[str, str, str]:
-    return (os.environ["ORADUCK_ORACLE_USER"], os.environ["ORADUCK_ORACLE_PASSWORD"],
-            os.environ["ORADUCK_ORACLE_DSN"])
+def _config() -> OracleConfig:
+    return OracleConfig.from_env()
 
 
 def _sink(db: str):
@@ -49,10 +49,10 @@ def run_oracledb(thick: bool, sql: str, db: str) -> dict:
 
     if thick:
         oracledb.init_oracle_client(lib_dir=os.environ["OCI_HOME"])
-    user, password, dsn = _credentials()
+    cfg = _config()
     con, state, add = _sink(db)
     started = time.perf_counter()
-    conn = oracledb.connect(user=user, password=password, dsn=dsn)
+    conn = oracledb.connect(user=cfg.user, password=cfg.password, dsn=cfg.dsn)
     try:
         for batch in conn.fetch_df_batches(sql, size=BATCH_SIZE):
             add(pyarrow.table(batch))
@@ -60,27 +60,27 @@ def run_oracledb(thick: bool, sql: str, db: str) -> dict:
         conn.close()
     total = time.perf_counter() - started
     con.close()
-    return {"total_s": total, "batches": state["batches"], "oracledb": oracledb.__version__,
-            "timed": "connect, fetch_df_batches and insert of every batch"}
+    return {"total_s": total, "batches": state["batches"], "oracledb": oracledb.__version__}
 
 
 def run_connectorx(sql: str, db: str, threads: int) -> dict:
     import connectorx as cx
     import pyarrow
 
-    user, password, dsn = _credentials()
-    from urllib.parse import quote
-
-    url = f"oracle://{quote(user, safe='')}:{quote(password, safe='')}@{dsn}"
+    url = connectorx_url(_config())
     con, state, add = _sink(db)
     extra = {"connectorx": cx.__version__}
     started = time.perf_counter()
     try:
         reader = cx.read_sql(url, sql, return_type="arrow_stream", partition_on="ID", partition_num=threads,
                              batch_size=BATCH_SIZE)
-    except ValueError:  # this version cannot stream: one Arrow table, only when it fits in memory
+    except ValueError as exc:
+        if str(exc) != "arrow_stream":  # only "return_type not supported by this version" falls back
+            raise
+        # no streaming: one Arrow table, only when it fits in memory (the failed attempt is not timed)
         if int(os.environ["ORADUCK_BENCH_CX_ESTIMATE"]) > int(os.environ["ORADUCK_BENCH_CX_AVAILABLE"]) / 2:
             return {"total_s": 0.0, "skipped": "result does not fit in memory", **extra}
+        started = time.perf_counter()
         add(cx.read_sql(url, sql, return_type="arrow", partition_on="ID", partition_num=threads))
         extra["return_type"] = "arrow"
     else:
@@ -89,13 +89,12 @@ def run_connectorx(sql: str, db: str, threads: int) -> dict:
         extra["return_type"] = "arrow_stream"
     total = time.perf_counter() - started
     con.close()
-    return {"total_s": total, "batches": state["batches"], **extra,
-            "timed": "read_sql (partitioned) and insert of every batch"}
+    return {"total_s": total, "batches": state["batches"], **extra}
 
 
 def main(argv: list[str]) -> int:
     method, table, threads, where, db = argv
-    sql = f"SELECT * FROM BENCH.{table} WHERE {where}" if "." not in table else f"SELECT * FROM {table} WHERE {where}"
+    sql = python_sql(table, where)
     if method == "oracledb_thin":
         result = run_oracledb(False, sql, db)
     elif method == "oracledb_thick":

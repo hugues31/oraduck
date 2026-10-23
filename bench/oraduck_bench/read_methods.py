@@ -35,18 +35,24 @@ class Measurement:
     extra: dict = field(default_factory=dict)
 
 
-def oraduck_sql(cfg: OracleConfig, table: str, threads: int, where: str, via: str = "attach") -> tuple[str, str]:
-    """(setup, timed statement). `table` is a BENCH table name or OWNER.TABLE."""
-    qualified = table if "." in table else f"{ORACLE_SCHEMA}.{table}"
+TIMED_SCOPE = "first contact with Oracle to the rows stored in DuckDB"
+
+
+def oraduck_sql(cfg: OracleConfig, table: str, threads: int, where: str,
+                via: str = "attach") -> tuple[str, list[str]]:
+    """(untimed setup, timed statements). `table` is a BENCH table name or OWNER.TABLE."""
+    qualified = _qualified(table)
     setup = f"SET threads = {threads};\n{_secret(cfg)}"
+    timed = []
     if via == "attach":
-        setup += "\nATTACH '' AS ora (TYPE oraduck, SECRET bench);"
+        timed.append("ATTACH '' AS ora (TYPE oraduck, SECRET bench);")
         source = f"ora.{qualified}"
     elif via == "scan":
         source = f"oraduck_scan('{qualified}', connection := 'bench')"
     else:
         raise ValueError(f"unknown path {via!r}")
-    return setup, f"CREATE TABLE t AS SELECT * FROM {source} WHERE {where};"
+    timed.append(f"CREATE TABLE t AS SELECT * FROM {source} WHERE {where};")
+    return setup, timed
 
 
 def reset_out_db() -> None:
@@ -54,18 +60,32 @@ def reset_out_db() -> None:
         READ_OUT_DB.with_name(READ_OUT_DB.name + suffix).unlink(missing_ok=True)
 
 
+def sessions_for(method: str, threads: int) -> int | str:
+    """Oracle sessions the method really opens: `threads` is the DuckDB setting, not the parallelism."""
+    if method in ("oraduck", "oraduck_scan", "connectorx"):
+        return threads  # one session per scan thread / ConnectorX partition
+    return 1  # quack-oracle and Rinie use one session by design; python-oracledb and SQL*Plus have one connection
+
+
+def output_extra(cli: Path | None = None) -> dict:
+    """Facts read from the output table, untimed: row count, file size, digest of the column types."""
+    rows = int(duck.query("SELECT count(*) FROM t;", READ_OUT_DB, cli=cli)[0][0])
+    types = duck.query("SELECT column_type, count(*) FROM (DESCRIBE t) GROUP BY 1 ORDER BY 1;", READ_OUT_DB,
+                       cli=cli)
+    return {"rows": rows, "db_bytes": READ_OUT_DB.stat().st_size, "types": {t: int(n) for t, n in types}}
+
+
 def run_oraduck(cfg: OracleConfig, table: str, threads: int, where: str, via: str = "attach",
                 timeout_s: float | None = READ_TIMEOUT_S, nrows: int = 0, ncols: int = 0) -> Measurement:
-    """Time of the CTAS alone (`timed` in extra): the ATTACH and secret are set up untimed, the bind/describe of
-    the first scan is inside the timer. The count and the file size are read afterwards, untimed."""
+    """Time of ATTACH + CTAS (secret creation untimed; the bind/describe of the first scan is inside the timer).
+    The count, the file size and the types are read afterwards, untimed."""
     reset_out_db()
-    setup, statement = oraduck_sql(cfg, table, threads, where, via)
-    total = duck.timed(setup, statement, READ_OUT_DB, timeout_s=timeout_s)
-    rows = int(duck.query("SELECT count(*) FROM t;", READ_OUT_DB)[0][0])
-    extra = {"rows": rows, "db_bytes": READ_OUT_DB.stat().st_size,
-             "timed": "CTAS (ATTACH untimed; bind/describe of the first scan included)"}
-    return Measurement("oraduck" if via == "attach" else "oraduck_scan", table, nrows, ncols, threads, total,
-                       None, extra)
+    setup, statements = oraduck_sql(cfg, table, threads, where, via)
+    total = duck.timed_sum(setup, statements, READ_OUT_DB, timeout_s=timeout_s)
+    method = "oraduck" if via == "attach" else "oraduck_scan"
+    extra = {**output_extra(), "duckdb": _duckdb_version(DUCKDB_CLI), "sessions": sessions_for(method, threads),
+             "timed": f"{TIMED_SCOPE}: " + ("ATTACH + CTAS" if via == "attach" else "CTAS")}
+    return Measurement(method, table, nrows, ncols, threads, total, None, extra)
 
 
 def _qualified(table: str) -> str:
@@ -76,27 +96,30 @@ def _duckdb_version(cli: Path) -> str:
     return duck.version(None if cli == DUCKDB_CLI else cli)
 
 
-def _extension_run(method: str, cli: Path, setup: str, statement: str, cfg_table: str, threads: int, where: str,
-                   timeout_s: float | None, unsigned: bool, timed: str) -> Measurement:
+def _extension_run(method: str, cli: Path, setup: str, statements: list[str], table: str, threads: int,
+                   timeout_s: float | None, unsigned: bool, detail: str) -> Measurement:
     reset_out_db()
-    total = duck.timed(setup, statement, READ_OUT_DB, timeout_s=timeout_s, unsigned=unsigned,
-                       cli=None if cli == DUCKDB_CLI else cli)
-    rows = int(duck.query("SELECT count(*) FROM t;", READ_OUT_DB)[0][0])
-    extra = {"rows": rows, "db_bytes": READ_OUT_DB.stat().st_size, "duckdb": _duckdb_version(cli), "timed": timed}
-    return Measurement(method, cfg_table, 0, 0, threads, total, None, extra)
+    cli_arg = None if cli == DUCKDB_CLI else cli
+    total = duck.timed_sum(setup, statements, READ_OUT_DB, timeout_s=timeout_s, unsigned=unsigned, cli=cli_arg)
+    extra = {**output_extra(cli_arg), "duckdb": _duckdb_version(cli), "sessions": sessions_for(method, threads),
+             "timed": f"{TIMED_SCOPE}: {detail}"}
+    return Measurement(method, table, 0, 0, threads, total, None, extra)
 
 
-def quack_oracle_sql(cfg: OracleConfig, table: str, threads: int, where: str) -> tuple[str, str]:
+def quack_oracle_sql(cfg: OracleConfig, table: str, threads: int, where: str) -> tuple[str, list[str]]:
+    """(untimed setup, timed statements): INSTALL, LOAD (the secret type needs it) and the secret are untimed,
+    ATTACH + CTAS timed."""
     setup = (f"SET threads = {threads};\nINSTALL oracle_scanner FROM community;\nLOAD oracle_scanner;\n"
              f"CREATE SECRET ora (TYPE oracle, HOST '{cfg.host}', PORT {cfg.port}, SERVICE_NAME '{cfg.service}', "
-             f"USER '{cfg.user}', PASSWORD '{cfg.password}');\nATTACH 'ora' AS o (TYPE oracle_scanner);")
-    return setup, f"CREATE TABLE t AS SELECT * FROM o.{table} WHERE {where};"
+             f"USER '{cfg.user}', PASSWORD '{cfg.password}');")
+    return setup, ["ATTACH 'ora' AS o (TYPE oracle_scanner);",
+                   f"CREATE TABLE t AS SELECT * FROM o.{table} WHERE {where};"]
 
 
-def rinie_oracle_sql(cfg: OracleConfig, table: str, threads: int, where: str) -> tuple[str, str]:
-    setup = (f"SET threads = {threads};\nLOAD '{RINIE_EXTENSION}';\n"
-             f"ATTACH '{cfg.user}/{cfg.password}@{cfg.dsn}' AS r (TYPE oracle);")
-    return setup, f"CREATE TABLE t AS SELECT * FROM r.{_qualified(table)} WHERE {where};"
+def rinie_oracle_sql(cfg: OracleConfig, table: str, threads: int, where: str) -> tuple[str, list[str]]:
+    setup = f"SET threads = {threads};\nLOAD '{RINIE_EXTENSION}';"  # LOAD untimed, as for quack
+    return setup, [f"ATTACH '{cfg.user}/{cfg.password}@{cfg.dsn}' AS r (TYPE oracle);",
+                   f"CREATE TABLE t AS SELECT * FROM r.{_qualified(table)} WHERE {where};"]
 
 
 _quack_cli: Path | None = None
@@ -116,22 +139,30 @@ def quack_cli() -> Path:
 
 def run_quack_oracle(cfg: OracleConfig, table: str, threads: int, where: str,
                      timeout_s: float | None = READ_TIMEOUT_S) -> Measurement:
-    setup, statement = quack_oracle_sql(cfg, table, threads, where)
-    return _extension_run("quack_oracle", quack_cli(), setup, statement, table, threads, where, timeout_s, False,
-                          "CTAS (ATTACH untimed)")
+    setup, statements = quack_oracle_sql(cfg, table, threads, where)
+    return _extension_run("quack_oracle", quack_cli(), setup, statements, table, threads, timeout_s, False,
+                          "ATTACH + CTAS (extension LOAD untimed)")
 
 
 def run_rinie_oracle(cfg: OracleConfig, table: str, threads: int, where: str,
                      timeout_s: float | None = READ_TIMEOUT_S) -> Measurement:
-    setup, statement = rinie_oracle_sql(cfg, table, threads, where)
-    return _extension_run("rinie_oracle", DUCKDB15_CLI, setup, statement, table, threads, where, timeout_s,
-                          RINIE_UNSIGNED, "CTAS (LOAD and ATTACH untimed)")
+    setup, statements = rinie_oracle_sql(cfg, table, threads, where)
+    return _extension_run("rinie_oracle", DUCKDB15_CLI, setup, statements, table, threads, timeout_s,
+                          RINIE_UNSIGNED, "ATTACH + CTAS (extension LOAD untimed)")
 
 
 # ---- Python clients, run as subprocesses ----
 
 def connectorx_url(cfg: OracleConfig) -> str:
+    """Used by read_python_methods (the one implementation)."""
     return f"oracle://{quote(cfg.user, safe='')}:{quote(cfg.password, safe='')}@{cfg.dsn}"
+
+
+PYTHON_TIMED = {
+    "oracledb_thin": "connect + fetch_df_batches + insert of every batch",
+    "oracledb_thick": "connect + fetch_df_batches + insert of every batch",
+    "connectorx": "read_sql (partitioned) + insert of every batch",
+}
 
 
 def python_sql(table: str, where: str) -> str:
@@ -145,18 +176,31 @@ def parse_python_result(stdout: str) -> dict:
     raise duck.DuckDBError(f"no result line in the output:\n{stdout[-2000:]}")
 
 
+FALLBACK_ROW_BYTES_PER_COLUMN = 100  # conservative: used when the optimizer statistics are missing
+
+
 def _estimated_row_bytes(cfg: OracleConfig, table: str) -> int:
-    """Average row length from the optimizer statistics (the read tables are analyzed), 0 when unknown."""
+    """Average row length from the optimizer statistics; a conservative per-column estimate when they are
+    missing. An Oracle error is reported as a DuckDBError (an `error` record, not an aborted case)."""
+    import oracledb
+
     from . import oracle
 
-    conn = oracle.connect(cfg)
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT avg_row_len FROM user_tables WHERE table_name = :t", t=table.split(".")[-1])
-            row = cur.fetchone()
-            return int(row[0] or 0) if row else 0
-    finally:
-        conn.close()
+        conn = oracle.connect(cfg)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT avg_row_len FROM user_tables WHERE table_name = :t",
+                            t=table.split(".")[-1].upper())
+                row = cur.fetchone()
+        finally:
+            conn.close()
+    except oracledb.Error as exc:
+        raise duck.DuckDBError(duck.redact(f"cannot estimate the row size of {table}: {exc}",
+                                           (cfg.password,))) from exc
+    if row and row[0]:
+        return int(row[0])
+    return int(table.split("_")[2]) * FALLBACK_ROW_BYTES_PER_COLUMN
 
 
 def _target_rows(table: str) -> int:
@@ -192,13 +236,14 @@ def _python_run(method: str, cfg: OracleConfig, table: str, threads: int, where:
     except subprocess.TimeoutExpired as exc:
         raise duck.MethodTimeout(f"{method} killed after {timeout_s} s") from exc
     if proc.returncode != 0:
-        raise duck.DuckDBError(duck.redact(f"{method} failed ({proc.returncode}):\n{proc.stderr.strip()[-3000:]}"))
+        raise duck.DuckDBError(duck.redact(f"{method} failed ({proc.returncode}):\n{proc.stderr.strip()[-3000:]}",
+                                           (cfg.password,)))
     result = parse_python_result(proc.stdout)
     total = result.pop("total_s")
     if result.get("skipped"):
         return Measurement(method, table, 0, 0, threads, 0.0, None, result)
-    rows = int(duck.query("SELECT count(*) FROM t;", READ_OUT_DB)[0][0])
-    result.update({"rows": rows, "db_bytes": READ_OUT_DB.stat().st_size})
+    result.update({**output_extra(), "duckdb": _duckdb_version(DUCKDB_CLI), "sessions": sessions_for(method, threads),
+                   "timed": f"{TIMED_SCOPE}: {PYTHON_TIMED[method]}"})
     return Measurement(method, table, 0, 0, threads, total, None, result)
 
 
@@ -222,6 +267,7 @@ def run_connectorx(cfg, table, threads, where, timeout_s=READ_TIMEOUT_S):
 def sqlplus_script(table: str, where: str, csv_path: str) -> str:
     # LONGCHUNKSIZE 1000000 (as planned) crashes SQL*Plus 19.32 (SIGSEGV) on tables with CLOBs, from 500000 up
     return "\n".join([
+        "WHENEVER SQLERROR EXIT SQL.SQLCODE", "WHENEVER OSERROR EXIT FAILURE",
         "SET TERMOUT OFF", "SET ECHO OFF", "SET VERIFY OFF", "SET TRIMSPOOL ON", "SET TRIMOUT ON",
         "SET PAGESIZE 0", "SET LINESIZE 32767", "SET NUMWIDTH 40", "SET TIMING OFF",
         f"SET ARRAYSIZE {SQLPLUS_ARRAYSIZE}", "SET LONG 1000000 LONGCHUNKSIZE 100000", "SET FEEDBACK OFF",
@@ -262,7 +308,7 @@ def run_sqlplus_csv(cfg, table, threads, where, timeout_s=READ_TIMEOUT_S) -> Mea
         spool_s = time.perf_counter() - started
         if proc.returncode != 0 or "ORA-" in proc.stdout or "SP2-" in proc.stdout or not csv_path.exists():
             raise duck.DuckDBError(duck.redact(f"sqlplus failed ({proc.returncode}):\n{proc.stdout[-2000:]}"
-                                               f"\n{proc.stderr[-1000:]}"))
+                                               f"\n{proc.stderr[-1000:]}", (cfg.password,)))
         csv_bytes = csv_path.stat().st_size
         remaining = None if timeout_s is None else max(1.0, timeout_s - spool_s)
         load_s = duck.timed(f"SET threads = {threads};", sqlplus_load_sql(str(csv_path), ncols), READ_OUT_DB,
@@ -270,10 +316,10 @@ def run_sqlplus_csv(cfg, table, threads, where, timeout_s=READ_TIMEOUT_S) -> Mea
     finally:
         csv_path.unlink(missing_ok=True)
         script.unlink(missing_ok=True)
-    rows = int(duck.query("SELECT count(*) FROM t;", READ_OUT_DB)[0][0])
-    extra = {"rows": rows, "db_bytes": READ_OUT_DB.stat().st_size, "spool_s": spool_s, "load_s": load_s,
-             "csv_bytes": csv_bytes, "duckdb": _duckdb_version(DUCKDB_CLI),
-             "timed": "sqlplus connect + spool to CSV, then read_csv CTAS"}
+    extra = {**output_extra(), "spool_s": spool_s, "load_s": load_s, "csv_bytes": csv_bytes,
+             "duckdb": _duckdb_version(DUCKDB_CLI), "sessions": sessions_for("sqlplus_csv", threads),
+             "timed": f"{TIMED_SCOPE}: sqlplus process start + connect + spool to CSV, then read_csv CTAS "
+                      "(start-up cannot be separated)"}
     return Measurement("sqlplus_csv", table, 0, 0, threads, spool_s + load_s, None, extra)
 
 

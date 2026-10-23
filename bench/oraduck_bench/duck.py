@@ -26,9 +26,20 @@ _PASSWORD = re.compile(r"(PASSWORD\s+')[^']*(')", re.IGNORECASE)
 _CONNECT_STRING = re.compile(r"([\w$#.-]+/)[^\s@'\"/]+(@)")
 
 
-def redact(text: str) -> str:
-    """Hides the passwords of CREATE SECRET statements and of user/password@dsn connect strings."""
-    return _CONNECT_STRING.sub(r"\1***\2", _PASSWORD.sub(r"\1***\2", text))
+_URL_CREDENTIALS = re.compile(r"([a-z][a-z0-9+.-]*://[^\s:/@'\"]+:)[^\s@'\"]+(@)", re.IGNORECASE)
+
+
+def redact(text: str, secrets: tuple[str, ...] = ()) -> str:
+    """Hides the passwords of CREATE SECRET statements, of user/password@dsn and scheme://user:password@host
+    strings, and every literal value of `secrets` (also when URL-encoded)."""
+    from urllib.parse import quote
+
+    text = _URL_CREDENTIALS.sub(r"\1***\2", _CONNECT_STRING.sub(r"\1***\2", _PASSWORD.sub(r"\1***\2", text)))
+    for secret in secrets:
+        if secret:
+            for form in {secret, quote(secret, safe="")}:
+                text = text.replace(form, "***")
+    return text
 
 
 class DuckDBError(RuntimeError):
@@ -76,6 +87,17 @@ def timed(setup: str, statement: str, db: Path | str, timeout_s: float | None = 
     if len(times) != 1:
         raise DuckDBError(f"missing or ambiguous timing in the output:\n{out[-2000:]}")
     return float(times[0])
+
+
+def timed_sum(setup: str, statements: list[str], db: Path | str, timeout_s: float | None = None,
+              unsigned: bool = False, cli: Path | None = None) -> float:
+    """Sum of the CLI timers of `statements` (each one timed on its own), `setup` untimed."""
+    body = "\n".join(f".timer on\n{st}\n.timer off" for st in statements)
+    out = run(f"{setup}\n{body}\n", db, timeout_s=timeout_s, unsigned=unsigned, cli=cli)
+    times = _TIMER.findall(out)
+    if len(times) != len(statements):
+        raise DuckDBError(f"expected {len(statements)} timings, got {len(times)}:\n{out[-2000:]}")
+    return sum(float(t) for t in times)
 
 
 def checksums(table: str, db: Path | str) -> Checksums:

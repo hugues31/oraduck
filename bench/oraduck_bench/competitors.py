@@ -37,11 +37,12 @@ def parquet_source_sql(table: str, nrows: int, ncols: int, parquet: Path) -> tup
 def export_source(table: str) -> Path:
     """Parquet copy of a source table (made once, by the 2.0 CLI, not timed)."""
     path = WORK / "parquet" / f"{table}_src15.parquet"
-    if not path.exists():
+    # rebuilt when the database file changed since the export (a regenerated table)
+    if not path.exists() or path.stat().st_mtime < Path(DUCKDB_FILE).stat().st_mtime:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
         duck.run(f"ATTACH '{DUCKDB_FILE}' AS src (READ_ONLY);\nCOPY src.{table} TO '{tmp}' (FORMAT parquet);")
-        tmp.rename(path)
+        tmp.replace(path)
     return path
 
 
@@ -75,6 +76,15 @@ def cli_for(method: str):
     return DUCKDB15_CLI if method in ("quack_oracle", "rinie_oracle") else None
 
 
+def source_description(method: str, nrows: int, ncols: int) -> str:
+    """Where the timed statement reads its rows from: "parquet" (read inside the timed window), "duckdb file"
+    or "memory" (an untimed in-memory copy)."""
+    in_file = (nrows, ncols) in FILE_SOURCE_CASES
+    if cli_for(method) is not None:
+        return "parquet" if in_file else "memory"
+    return "duckdb file" if in_file else "memory"
+
+
 def should_skip(timeouts: set[tuple[str, int, int]], method: str, nrows: int, ncols: int) -> bool:
     """A method that timed out is not run on cases with at least as many rows and columns."""
     return any(m == method and nrows >= r and ncols >= c for m, r, c in timeouts)
@@ -89,10 +99,12 @@ def run(cfg: OracleConfig, method: str, nrows: int, ncols: int, threads: int,
     else:
         source_setup, source = parquet_source_sql(table, nrows, ncols, export_source(table))
     setup, statement, unsigned = method_sql(method, cfg, oracle_table or table, source, threads)
+    source_kind = source_description(method, nrows, ncols)
     total = duck.timed(f"{setup}\n{source_setup}", statement, ":memory:", timeout_s=timeout_s, unsigned=unsigned,
                        cli=cli_for(method))
     stream_size = ORADUCK_STREAM_SIZE if method == "oraduck" else None
-    return Measurement(method, table, nrows, ncols, threads, total, stream_size=stream_size)
+    return Measurement(method, table, nrows, ncols, threads, total, stream_size=stream_size,
+                       extra={"source": source_kind, "sessions": threads if method == "oraduck" else 1})
 
 
 def versions() -> dict[str, str]:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import duck, schema
 from .config import CSV_ROOT, DUCKDB_FILE, ORACLE_SCHEMA, SQLLDR_PARAMS, OracleConfig
@@ -29,6 +29,7 @@ class Measurement:
     csv_bytes: int | None = None
     csv_files: int | None = None
     stream_size: int | None = None
+    extra: dict = field(default_factory=dict)
 
 
 def _secret(cfg: OracleConfig) -> str:

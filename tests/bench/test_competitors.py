@@ -107,3 +107,27 @@ def test_parquet_source_for_the_1_5_5_cli(tmp_path):
     assert ref == "src_mem"
     setup, ref = competitors.parquet_source_sql("B_10000000_50", 10_000_000, 50, tmp_path / "x.parquet")
     assert setup == "" and ref.startswith("read_parquet(")
+
+
+def test_source_description_says_where_the_rows_come_from():
+    assert competitors.source_description("rinie_oracle", 10_000_000, 50) == "parquet"
+    assert competitors.source_description("rinie_oracle", 1_000_000, 20) == "memory"
+    assert competitors.source_description("oraduck", 10_000_000, 50) == "duckdb file"
+    assert competitors.source_description("oraduck", 100_000, 5) == "memory"
+
+
+def test_parquet_export_is_rebuilt_when_the_database_changed(tmp_path, monkeypatch):
+    import os
+    calls = []
+    monkeypatch.setattr(competitors, "WORK", tmp_path)
+    db = tmp_path / "bench.duckdb"
+    db.write_text("x")
+    monkeypatch.setattr(competitors, "DUCKDB_FILE", db)
+    monkeypatch.setattr(competitors.duck, "run", lambda sql, *a, **k: calls.append(sql) or
+                        (tmp_path / "parquet" / "T_src15.tmp").write_text("p"))
+    competitors.export_source("T")
+    competitors.export_source("T")
+    assert len(calls) == 1  # cached
+    os.utime(db, (os.stat(db).st_atime, os.stat(db).st_mtime + 100))
+    competitors.export_source("T")
+    assert len(calls) == 2
