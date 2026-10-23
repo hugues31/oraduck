@@ -106,6 +106,90 @@ TEST_CASE("Source description: view and synonyms", "[oracle][describe_source]") 
 	CleanUp(session);
 }
 
+namespace {
+
+const OracleTableDescription *FindDescription(const std::vector<OracleTableDescription> &all, const std::string &name) {
+	for (const auto &d : all) {
+		if (d.name == name) {
+			return &d;
+		}
+	}
+	return nullptr;
+}
+
+// Every field of the two descriptions is equal
+void CheckSameDescription(const OracleTableDescription &a, const OracleTableDescription &b) {
+	INFO(b.owner + "." + b.name);
+	CHECK(a.owner == b.owner);
+	CHECK(a.name == b.name);
+	CHECK(a.kind == b.kind);
+	CHECK(a.partitioned == b.partitioned);
+	CHECK(a.num_rows == b.num_rows);
+	CHECK(a.owned_by_session_user == b.owned_by_session_user);
+	CHECK(a.db_charset == b.db_charset);
+	CHECK(a.nchar_charset == b.nchar_charset);
+	REQUIRE(a.columns.size() == b.columns.size());
+	for (size_t i = 0; i < a.columns.size(); i++) {
+		const auto &x = a.columns[i];
+		const auto &y = b.columns[i];
+		INFO(y.name);
+		CHECK(x.name == y.name);
+		CHECK(x.data_type == y.data_type);
+		CHECK(x.family == y.family);
+		CHECK(x.data_length == y.data_length);
+		CHECK(x.precision == y.precision);
+		CHECK(x.scale == y.scale);
+		CHECK(x.nullable == y.nullable);
+		CHECK(x.char_length == y.char_length);
+		CHECK(x.national == y.national);
+		CHECK(x.collation == y.collation);
+	}
+}
+
+} // namespace
+
+TEST_CASE("Schema description: tables and views of an owner", "[oracle][describe_source]") {
+	OciSession session(TestCredentials());
+	CleanUp(session);
+	session.Execute("CREATE TABLE ITEST_SRC (N NUMBER, N259 NUMBER(25,9), V VARCHAR2(10 CHAR), NV NVARCHAR2(5), "
+	                "C CHAR(3), D DATE, TS TIMESTAMP(6), CL CLOB, RW RAW(8), ID NUMBER(10) NOT NULL)");
+	session.Execute("CREATE TABLE ITEST_SRC_P (ID NUMBER, K VARCHAR2(5)) PARTITION BY LIST (K) "
+	                "(PARTITION P1 VALUES ('A'), PARTITION P2 VALUES ('B'))");
+	session.Execute("INSERT INTO ITEST_SRC_P VALUES (1, 'A')");
+	session.Execute("INSERT INTO ITEST_SRC_P VALUES (2, 'B')");
+	session.Execute("BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'ITEST_SRC_P'); END;");
+	session.Execute("CREATE VIEW ITEST_SRC_V AS SELECT ID, V, D FROM ITEST_SRC");
+	session.Execute("CREATE SYNONYM ITEST_SRC_SYN FOR ITEST_SRC");
+
+	const auto all = DescribeSchema(session, "BENCH");
+	for (const std::string name : {"ITEST_SRC", "ITEST_SRC_P", "ITEST_SRC_V"}) {
+		const auto *found = FindDescription(all, name);
+		REQUIRE(found);
+		CheckSameDescription(*found, DescribeSource(session, ParseTargetName("BENCH." + name)));
+	}
+	CHECK(FindDescription(all, "ITEST_SRC")->kind == SourceKind::kTable);
+	CHECK(FindDescription(all, "ITEST_SRC_P")->partitioned);
+	CHECK(FindDescription(all, "ITEST_SRC_P")->num_rows == 2);
+	CHECK(FindDescription(all, "ITEST_SRC_V")->kind == SourceKind::kView);
+	// Synonyms are not listed
+	CHECK_FALSE(FindDescription(all, "ITEST_SRC_SYN"));
+	for (const auto &d : all) {
+		CHECK(d.owner == "BENCH");
+	}
+	CHECK(DescribeSchema(session, "NO_SUCH_USER_XYZ").empty());
+
+	// The reader sees only what it was granted
+	session.Execute("GRANT SELECT ON ITEST_SRC TO " + RequiredEnv("ORADUCK_ORACLE_READER_USER"));
+	OciSession reader(ReaderCredentials());
+	const auto granted = DescribeSchema(reader, "BENCH");
+	REQUIRE(FindDescription(granted, "ITEST_SRC"));
+	CHECK_FALSE(FindDescription(granted, "ITEST_SRC_P"));
+	CHECK_FALSE(FindDescription(granted, "ITEST_SRC")->owned_by_session_user);
+	CheckSameDescription(*FindDescription(granted, "ITEST_SRC"),
+	                     DescribeSource(reader, ParseTargetName("BENCH.ITEST_SRC")));
+	CleanUp(session);
+}
+
 TEST_CASE("Source description: errors", "[oracle][describe_source]") {
 	OciSession session(TestCredentials());
 	CleanUp(session);

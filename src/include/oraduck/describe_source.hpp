@@ -21,9 +21,20 @@ struct OracleTableDescription {
 	std::vector<OracleColumn> columns;
 };
 
+// Thrown by DescribeSource when the table or view does not exist or is not accessible.
+class SourceNotFoundError : public OraduckError {
+public:
+	using OraduckError::OraduckError;
+};
+
 // Resolves the name (current schema when the owner is absent, synonyms followed) and describes the table or view.
-// Throws OraduckError when it does not exist or is not accessible.
+// Throws SourceNotFoundError when it does not exist or is not accessible, OraduckError for other failures.
 OracleTableDescription DescribeSource(OciSession &session, const TargetName &name);
+
+// Describes every table and view of owner accessible to the session (synonyms are not listed), with the same fields
+// as DescribeSource: the objects, then all their columns in one query, then the table statistics. Empty when the owner
+// has none or does not exist.
+std::vector<OracleTableDescription> DescribeSchema(OciSession &session, const std::string &owner);
 
 // Session settings for reading: binary comparison and sorting and the Gregorian calendar, so pushed-down filters
 // match DuckDB's semantics.

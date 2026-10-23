@@ -9,6 +9,7 @@
 
 #include "oraduck/errors.hpp"
 #include "oraduck/oci_api.hpp"
+#include "oraduck_catalog.hpp"
 #include "oraduck_copy.hpp"
 #include "oraduck_scan.hpp"
 #include "oraduck_secret.hpp"
@@ -33,6 +34,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterOraduckSecret(loader);
 	RegisterOraduckCopy(loader);
 	RegisterOraduckScan(loader);
+	RegisterOraduckStorage(loader);
 }
 
 void OraduckExtension::Load(ExtensionLoader &loader) {

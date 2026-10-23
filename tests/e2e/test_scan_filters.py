@@ -1,14 +1,13 @@
 """oraduck_scan filter pushdown (spec 4.3): equivalence with DuckDB, partition pruning, views, filters kept in DuckDB."""
 
-import time
 import uuid
 
 import oracledb
 import pytest
 
 from conftest import wait_for_snapshot
-from oraduck_helpers import (WORKDIR, OracleTable, env, json_documents, run_duckdb, scan_call, scan_json, secret_sql,
-                             split_warnings)
+from oraduck_helpers import (WORKDIR, OracleTable, assert_pruned, env, json_documents, run_duckdb, scan_call, scan_json,
+                             secret_sql, split_warnings)
 
 ROWS = 30_000
 NOTHING = "—"
@@ -186,52 +185,6 @@ def results(sql: str, db: str) -> list[list[dict]]:
     documents = [d for d in json_documents(split_warnings(proc.stdout)[0]) if isinstance(d, list)]
     assert documents[0] == [{"Success": True}], documents[0]
     return documents[1:]
-
-
-def logical_reads(conn, table: str) -> dict[str, int]:
-    """V$SEGMENT_STATISTICS logical reads of each (sub)partition segment of table."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT subobject_name, value FROM v$segment_statistics WHERE owner = USER AND object_name = :t "
-            "AND statistic_name = 'logical reads'", t=table)
-        return {name: int(value) for name, value in cur.fetchall()}
-
-
-def settled_reads(conn, table: str, timeout: float = 60) -> dict[str, int]:
-    """Logical reads once two readings a second apart agree (sessions of the query may still be ending)."""
-    deadline = time.monotonic() + timeout
-    previous = logical_reads(conn, table)
-    while True:
-        time.sleep(1)
-        current = logical_reads(conn, table)
-        if current == previous:
-            return current
-        assert time.monotonic() < deadline, f"segment statistics of {table} keep changing"
-        previous = current
-
-
-def reads_during(conn, table: str, sql: str) -> tuple[list[dict], dict[str, int]]:
-    """Result of sql and the logical reads it caused on each segment of table (by steps of 16: V$SEGMENT_STATISTICS
-    counts them so). conn is a session that does not read table."""
-    before = settled_reads(conn, table)
-    rows = scan_json(sql)
-    after = settled_reads(conn, table)
-    assert after, f"no segment statistics for {table}"
-    return rows, {name: after[name] - before.get(name, 0) for name in after}
-
-
-def assert_pruned(conn, table: str, where: str, rows: list[dict], read: set[str], segments: int) -> None:
-    """SELECT count(*) AS n, sum(id) AS s FROM the scan of table WHERE where returns rows and reads only the segments
-    in read. With split 'none', the other segments have no logical read at all. With the default split (extents), the
-    planner's DBA_EXTENTS query also reads a few blocks of every segment header, which V$SEGMENT_STATISTICS (steps of
-    16) may show as one step on another segment; reading a segment's rows costs hundreds."""
-    for options, stray in (("split := 'none'", 0), ("", 16)):
-        sql = f"SELECT count(*) AS n, sum(id)::BIGINT AS s FROM {scan_call(table, options)} WHERE {where}"
-        result, reads = reads_during(conn, table, sql)
-        assert result == rows, sql
-        assert len(reads) == segments, reads
-        assert all(reads[name] > 0 for name in read), (sql, reads)
-        assert {name: n for name, n in reads.items() if name not in read and n > stray} == {}, (sql, reads)
 
 
 @pytest.fixture(scope="module")

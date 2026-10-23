@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from decimal import Decimal
 from pathlib import Path
 
@@ -34,6 +35,11 @@ def secret_sql(name: str = "ora", reader: bool = False) -> str:
         f"CREATE SECRET {name} (TYPE oraduck, USER '{env(prefix + '_USER')}', "
         f"PASSWORD '{env(prefix + '_PASSWORD')}', DSN '{env('ORADUCK_ORACLE_DSN')}');\n"
     )
+
+
+def attach_sql(name: str = "ora", secret: str = "ora", options: str = "") -> str:
+    """ATTACH of the Oracle database of secret as name (read-only catalog), with extra ATTACH options."""
+    return f"ATTACH '' AS {name} (TYPE oraduck, SECRET {secret}{', ' + options if options else ''});\n"
 
 
 def run_duckdb(sql: str, db: str = ":memory:", timeout: float = 600,
@@ -129,6 +135,57 @@ def explain_scan(sql: str, setup: str = "", analyze: bool = False, reader: bool 
 def scan_call(table: str, options: str = "") -> str:
     """oraduck_scan('<table>', connection := 'ora'[, options])."""
     return f"oraduck_scan('{table}', connection := 'ora'{', ' + options if options else ''})"
+
+
+def logical_reads(conn, table: str) -> dict[str, int]:
+    """V$SEGMENT_STATISTICS logical reads of each (sub)partition segment of table."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT subobject_name, value FROM v$segment_statistics WHERE owner = USER AND object_name = :t "
+            "AND statistic_name = 'logical reads'", t=table)
+        return {name: int(value) for name, value in cur.fetchall()}
+
+
+def settled_reads(conn, table: str, timeout: float = 60) -> dict[str, int]:
+    """Logical reads once two readings a second apart agree (sessions of the query may still be ending)."""
+    deadline = time.monotonic() + timeout
+    previous = logical_reads(conn, table)
+    while True:
+        time.sleep(1)
+        current = logical_reads(conn, table)
+        if current == previous:
+            return current
+        assert time.monotonic() < deadline, f"segment statistics of {table} keep changing"
+        previous = current
+
+
+def reads_during(conn, table: str, sql: str, setup: str = "") -> tuple[list[dict], dict[str, int]]:
+    """Result of sql (run after setup) and the logical reads it caused on each segment of table (by steps of 16:
+    V$SEGMENT_STATISTICS counts them so). conn is a session that does not read table."""
+    before = settled_reads(conn, table)
+    rows = scan_json(sql, setup)
+    after = settled_reads(conn, table)
+    assert after, f"no segment statistics for {table}"
+    return rows, {name: after[name] - before.get(name, 0) for name in after}
+
+
+def assert_pruned(conn, table: str, where: str, rows: list[dict], read: set[str], segments: int,
+                  sources: list[tuple[str, str, int]] | None = None) -> None:
+    """SELECT count(*) AS n, sum(id) AS s FROM each source WHERE where returns rows and reads only the segments in
+    read. A source is (setup, FROM clause, stray reads allowed on another segment); the default sources are
+    oraduck_scan with split 'none' and with the default split. With split 'none', the other segments have no logical
+    read at all. With the default split (extents), the planner's DBA_EXTENTS query also reads a few blocks of every
+    segment header, which V$SEGMENT_STATISTICS (steps of 16) may show as one step on another segment; reading a
+    segment's rows costs hundreds."""
+    if sources is None:
+        sources = [("", scan_call(table, "split := 'none'"), 0), ("", scan_call(table), 16)]
+    for setup, source, stray in sources:
+        sql = f"SELECT count(*) AS n, sum(id)::BIGINT AS s FROM {source} WHERE {where}"
+        result, reads = reads_during(conn, table, sql, setup)
+        assert result == rows, sql
+        assert len(reads) == segments, reads
+        assert all(reads[name] > 0 for name in read), (sql, reads)
+        assert {name: n for name, n in reads.items() if name not in read and n > stray} == {}, (sql, reads)
 
 
 def _copy_script(query: str, target: str, options: str, setup: str, secret: bool) -> str:

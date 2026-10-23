@@ -133,7 +133,7 @@ struct OraduckScanLocalState : public LocalTableFunctionState {
 
 unique_ptr<FunctionData> OraduckScanBind(ClientContext &context, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
-	ScanOptions options;
+	OraduckScanOptions options;
 	string secret_name;
 	for (auto &entry : input.named_parameters) {
 		const auto name = entry.first.GetIdentifierName();
@@ -376,6 +376,17 @@ unique_ptr<FunctionData> OraduckScanDeserialize(Deserializer &, BoundTableFuncti
 	throw NotImplementedException("OraDuck: an oraduck_scan plan cannot be deserialized");
 }
 
+// The attached table read, for the binder (DELETE, UPDATE, ... reach the catalog's read-only errors) and the
+// optimizers. Once filters are pushed into the bind data the scan no longer reads the whole table, and the optimizers
+// that reason about a table's scans only know of table filters: the scan then has no table, like oraduck_scan.
+optional_ptr<TableCatalogEntry> OraduckScanTableEntry(optional_ptr<const FunctionData> bind_data) {
+	if (!bind_data) {
+		return nullptr;
+	}
+	auto &bind = bind_data->Cast<OraduckScanBindData>();
+	return bind.filters.empty() ? bind.table_entry : nullptr;
+}
+
 bool SameFilters(const std::vector<oraduck::SqlFragment> &a, const std::vector<oraduck::SqlFragment> &b) {
 	if (a.size() != b.size()) {
 		return false;
@@ -405,7 +416,7 @@ bool OraduckScanBindData::Equals(const FunctionData &other_p) const {
 	       options.unconstrained.scale == other.options.unconstrained.scale && SameFilters(filters, other.filters);
 }
 
-void ApplyScanOption(ScanOptions &options, const string &name, const Value &value) {
+void ApplyScanOption(OraduckScanOptions &options, const string &name, const Value &value) {
 	const auto key = StringUtil::Lower(name);
 	if (key == "sessions") {
 		auto number = value.IsNull() ? optional<Value>() : value.DefaultTryCastAs(LogicalType::BIGINT);
@@ -463,7 +474,7 @@ vector<string> DuckColumnNames(const oraduck::OracleTableDescription &source) {
 }
 
 unique_ptr<FunctionData> BindOraduckScan(ClientContext &, oraduck::OracleCredentials credentials,
-                                         oraduck::OracleTableDescription source, const ScanOptions &options,
+                                         oraduck::OracleTableDescription source, const OraduckScanOptions &options,
                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (source.columns.empty()) {
 		throw BinderException("OraDuck: Oracle %s %s has no column visible to the user",
@@ -508,6 +519,7 @@ TableFunction GetOraduckScanFunction() {
 	function.order_preservation_type = OrderPreservationType::NO_ORDER;
 	function.cardinality = OraduckScanCardinality;
 	function.get_virtual_columns = OraduckScanVirtualColumns;
+	function.get_table_entry = OraduckScanTableEntry;
 	function.to_string = OraduckScanToString;
 	function.get_metrics = OraduckScanGetMetrics;
 	return function;

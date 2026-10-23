@@ -15,8 +15,9 @@ namespace duckdb {
 
 class ExtensionLoader;
 
-// Options of oraduck_scan, also the defaults of every scan of an attached Oracle database.
-struct ScanOptions {
+// Options of oraduck_scan, also the defaults of every scan of an attached Oracle database (not duckdb::ScanOptions,
+// DuckDB's storage scan options).
+struct OraduckScanOptions {
 	uint32_t sessions = 0; // 0: DuckDB's number of threads
 	oraduck::SplitStrategy split = oraduck::SplitStrategy::kAuto;
 	oraduck::UnconstrainedNumber unconstrained;
@@ -27,8 +28,9 @@ struct OraduckScanBindData : public TableFunctionData {
 	oraduck::OracleCredentials credentials;
 	oraduck::OracleTableDescription source;
 	std::vector<oraduck::ReadColumnPlan> columns; // one per Oracle column, in column order
-	ScanOptions options;
-	std::vector<oraduck::SqlFragment> filters; // filters pushed down to Oracle, combined with AND
+	OraduckScanOptions options;
+	std::vector<oraduck::SqlFragment> filters;   // filters pushed down to Oracle, combined with AND
+	optional_ptr<TableCatalogEntry> table_entry; // the attached table read (ATTACH), null for oraduck_scan
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;
@@ -42,14 +44,14 @@ TableFunction GetOraduckScanFunction();
 
 // Validates and applies one option by name (sessions, split, unconstrained_number, snapshot; case-insensitive);
 // throws InvalidInputException naming the accepted values.
-void ApplyScanOption(ScanOptions &options, const string &name, const Value &value);
+void ApplyScanOption(OraduckScanOptions &options, const string &name, const Value &value);
 
 // DuckDB column names: the Oracle names, deduplicated case-insensitively in column order by appending _1, _2, ...
 vector<string> DuckColumnNames(const oraduck::OracleTableDescription &source);
 
 // Bind data of a scan of a described table or view; fills the DuckDB column types and names.
 unique_ptr<FunctionData> BindOraduckScan(ClientContext &context, oraduck::OracleCredentials credentials,
-                                         oraduck::OracleTableDescription source, const ScanOptions &options,
+                                         oraduck::OracleTableDescription source, const OraduckScanOptions &options,
                                          vector<LogicalType> &return_types, vector<Identifier> &names);
 
 } // namespace duckdb

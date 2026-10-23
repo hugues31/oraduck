@@ -1,0 +1,58 @@
+# name: test/sql/oraduck_attach.test
+# description: ATTACH (TYPE oraduck) errors detected without Oracle
+# group: [oraduck]
+
+require oraduck
+
+statement error
+ATTACH '' AS ora (TYPE oraduck);
+----
+SECRET
+
+statement error
+ATTACH 'x' AS ora (TYPE oraduck, SECRET s);
+----
+path must be empty
+
+statement error
+ATTACH '' AS ora (TYPE oraduck, SECRET absent);
+----
+not found
+
+# Option values are checked before the secret is fetched, with oraduck_scan's names and values
+statement error
+ATTACH '' AS ora (TYPE oraduck, SECRET absent, SPLIT 'random');
+----
+<REGEX>:.*auto.*extents.*hash.*none.*
+
+statement error
+ATTACH '' AS ora (TYPE oraduck, SECRET absent, SESSIONS 0);
+----
+<REGEX>:.*sessions.*1.*1024.*
+
+statement error
+ATTACH '' AS ora (TYPE oraduck, SECRET absent, SNAPSHOT 'later');
+----
+<REGEX>:.*snapshot.*auto.*scn.*none.*
+
+statement error
+ATTACH '' AS ora (TYPE oraduck, SECRET absent, UNCONSTRAINED_NUMBER 'BIGINT');
+----
+<REGEX>:.*DOUBLE.*VARCHAR.*DECIMAL.*
+
+statement error
+ATTACH '' AS ora (TYPE oraduck, SECRET absent, TOTO 1);
+----
+<REGEX>:.*toto.*secret.*sessions.*split.*
+
+# Valid values in any case pass the option checks and reach the secret lookup
+statement error
+ATTACH '' AS ora (TYPE oraduck, SECRET 'absent', SESSIONS 4, SPLIT 'Hash', SNAPSHOT 'NONE', UNCONSTRAINED_NUMBER 'decimal(20, 4)');
+----
+not found
+
+# No database was attached by the failed statements
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'ora';
+----
+0
