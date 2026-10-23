@@ -1,18 +1,26 @@
 # OraDuck
 
-A DuckDB extension that loads the result of a query into an Oracle table through
-the OCI Direct Path API — the engine behind `sqlldr direct=true` — in parallel
-(one Oracle session per DuckDB thread) and without any intermediate file.
+A DuckDB extension that reads Oracle tables (`ATTACH` and `oraduck_scan`, in
+parallel, with filter pushdown) and loads the result of a query into an Oracle
+table through the OCI Direct Path API — the engine behind `sqlldr direct=true` —
+in parallel (one Oracle session per DuckDB thread) and without any intermediate
+file.
 
 ```sql
 INSTALL oraduck FROM community;
 LOAD oraduck;
 CREATE SECRET oracle_test (TYPE oraduck, USER 'bench', PASSWORD '...', DSN 'dbhost:1521/ORCLPDB1');
+-- read
+ATTACH '' AS ora (TYPE oraduck, SECRET oracle_test);
+SELECT * FROM ora.MY_SCHEMA.MY_TABLE WHERE operation_date = DATE '2024-05-07';
+-- write
 COPY (SELECT id, amount, operation_date, label FROM source)
 TO 'MY_SCHEMA.MY_TABLE' (FORMAT ORADUCK, CONNECTION 'oracle_test');
 ```
 
-On Oracle 19c, over 9 table shapes from 100k × 5 to 10M × 50, OraDuck is:
+The reader is described in [Read from Oracle](#read-from-oracle).
+
+Write benchmark: on Oracle 19c, over 9 table shapes from 100k × 5 to 10M × 50, OraDuck is:
 
 - 1.2 to 3.2 times faster than exporting the table to CSV files and loading
   them with parallel direct path `sqlldr` (median of 5 runs);
@@ -217,6 +225,202 @@ Any other type is rejected at bind time: convert it with `CAST`.
   empty directory named after the target before OraDuck can refuse them.
 - A view passes the bind checks and fails on the first rows sent (ORA-39826);
   nothing is loaded.
+
+## Read from Oracle
+
+OraDuck reads Oracle tables, views and synonyms through a read-only `ATTACH`.
+It uses the same `oraduck` secret as the writer (see [Secret](#secret)).
+
+```sql
+CREATE SECRET oracle_prod (TYPE oraduck, USER '...', PASSWORD '...', DSN 'dbhost:1521/SERVICE');
+ATTACH '' AS ora (TYPE oraduck, SECRET oracle_prod);
+SELECT * FROM ora.MY_SCHEMA.TOTO WHERE part_date = DATE '2024-05-07';
+```
+
+### ATTACH
+
+| Option | Default | Purpose |
+|---|---|---|
+| `SECRET` | required | name of an `oraduck` secret |
+| `SESSIONS` | `SET threads` | Oracle sessions per scan (1 to 1024) |
+| `SPLIT` | `auto` | how a scan is divided between sessions: `auto`, `extents`, `hash`, `none` |
+| `SNAPSHOT` | `auto` | read consistency: `auto`, `scn`, `none` |
+| `UNCONSTRAINED_NUMBER` | `DOUBLE` | DuckDB type of a `NUMBER` without precision: `DOUBLE`, `VARCHAR`, `DECIMAL(p,s)` |
+
+The options after `SECRET` have the same meaning as the `oraduck_scan`
+parameters (below). The path must be empty: the connection comes from the
+secret.
+
+- Schemas are Oracle users. The default schema is the connected user's current
+  schema (`ora.TOTO`). Names are matched exactly, then upper-cased (Oracle's
+  unquoted names): `ora.toto` finds `TOTO`.
+- Tables, views and synonyms are readable. Public synonyms are reachable from
+  the default schema (`ora.DUAL`), not from another schema.
+- `SHOW TABLES FROM ora` lists the connected user's schema, and the other
+  schemas once a query has named them: listing never walks every Oracle user.
+- A table's description is cached until `DETACH` and a new `ATTACH`: a column
+  added in Oracle is not seen before that.
+- The database is read-only. `INSERT`, `UPDATE`, `DELETE`, DDL and the other
+  writes fail with `OraDuck: attached Oracle databases are read-only; load data
+  with COPY … TO '<SCHEMA.TABLE>' (FORMAT ORADUCK, CONNECTION '<secret>')`.
+  `ANALYZE` and `VACUUM` on an attached table are not supported (they scan the
+  table before failing).
+
+### oraduck_scan
+
+```sql
+SELECT * FROM oraduck_scan('MY_SCHEMA.TOTO', connection := 'oracle_prod');
+SELECT * FROM oraduck_scan('TOTO', connection := 'oracle_prod',
+                           sessions := 8, split := 'extents', snapshot := 'scn',
+                           unconstrained_number := 'DECIMAL(20,4)');
+```
+
+`oraduck_scan('<[SCHEMA.]TABLE>', connection := '<secret>' [, sessions := n]
+[, split := 'auto'|'extents'|'hash'|'none'] [, snapshot := 'auto'|'scn'|'none']
+[, unconstrained_number := 'DOUBLE'|'VARCHAR'|'DECIMAL(p,s)'])`
+
+`connection` is required. The name is read like the COPY target (unquoted
+names are upper-cased, double-quoted names are kept as is).
+
+Wrapped in a view, the function keeps the filter pushdown:
+
+```sql
+CREATE VIEW toto AS FROM oraduck_scan('MY_SCHEMA.TOTO', connection := 'oracle_prod');
+SELECT count(*) FROM toto WHERE part_date = DATE '2024-05-07';
+```
+
+### How a read runs
+
+**Projection.** Only the selected columns are fetched (`count(*)` fetches
+none).
+
+**Filters.** The filters of the `WHERE` clause that Oracle evaluates exactly as
+DuckDB would go to the Oracle `WHERE` clause, which lets Oracle prune
+partitions and use its indexes. Pushed: comparisons (`=`, `<>`, `<`, `<=`, `>`,
+`>=`), `BETWEEN`, `IN` (up to 1,000 values), `IS [NOT] NULL`, `AND`/`OR`
+combinations of these, and `CAST(ts AS DATE) = DATE '...'` on a `DATE` column.
+Everything else stays in DuckDB and is applied to the rows received.
+
+- A constant is pushed only when it has the DuckDB type of the column: `dec IN
+  (0, 0.25, -250)` against a `DECIMAL` column stays in DuckDB (the list mixes
+  constant types, so DuckDB does not give them all the column's type).
+- String comparisons are pushed only for non-empty constants and a column
+  without column-level collation; string ranges (`<`, `<=`, `>`, `>=`,
+  `BETWEEN`) only on AL32UTF8 databases, for non-national columns. On another
+  character set only ASCII constants are pushed.
+- Stays in DuckDB: `LIKE`, `NOT`, functions on a column, empty strings
+  (`''` is NULL in Oracle), unconstrained `NUMBER` columns (read as `DOUBLE` by
+  default), time zone types, `TIMESTAMP(n)` with n above 6, comparisons on LOB columns.
+
+`EXPLAIN` shows what was pushed (`Oracle WHERE`) and the requested options:
+
+```sql
+EXPLAIN SELECT * FROM ora.MY_SCHEMA.TOTO WHERE part_date = DATE '2024-05-07';
+-- Table: MY_SCHEMA.TOTO
+-- Oracle WHERE: ("PART_DATE" = DATE '2024-05-07')
+-- Split: auto
+-- Snapshot: auto
+```
+
+**Parallel sessions.** A scan opens up to `SESSIONS` Oracle sessions (default:
+`SET threads = N`), never more than it has work units. The units come from the
+split strategy:
+
+| `SPLIT` | Units | Needs |
+|---|---|---|
+| `auto` | `extents` for a table, `hash` for a view or when `extents` is not possible | |
+| `extents` | ranges of ROWIDs, from the table's extents | a heap table (not a view; not index-organized, clustered, external or hybrid partitioned) |
+| `hash` | `ORA_HASH(ROWID, n-1) = k`: one full scan per session | a source that has a ROWID (not a join or aggregate view) |
+| `none` | one session, one query | |
+
+`extents` reads `DBA_EXTENTS` when the user can. Otherwise it creates a
+temporary `DBMS_PARALLEL_EXECUTE` task, reads its chunks and drops it:
+OraDuck then writes a task row in Oracle's dictionary for a moment (the user
+needs access to `DBMS_PARALLEL_EXECUTE`). With `auto`, an `extents`
+failure falls back to `hash`, and `hash` to one session, with a note; with an
+explicit `SPLIT`, it is an error.
+
+**Consistency.** With `SNAPSHOT 'auto'`, every session reads `AS OF SCN` of one
+SCN, read at planning time, when the user has `EXECUTE ON DBMS_FLASHBACK` or
+`SELECT ON V_$DATABASE`: the sessions see the same data even when Oracle is
+being written. Without that privilege, or when a flashback query is refused,
+each session reads at its own moment, and the scan says so in its `Snapshot`
+and `Notes` in `EXPLAIN ANALYZE` and as a warning in the DuckDB log.
+`snapshot := 'scn'` turns that situation into an error; `'none'` never uses an
+SCN. Flashback query needs `FLASHBACK` on another user's table.
+
+`EXPLAIN ANALYZE` adds what the run did:
+
+| Key | Content |
+|---|---|
+| `Strategy` | the split strategy used |
+| `Units` | number of work units |
+| `Sessions` | Oracle sessions used |
+| `Snapshot` | the SCN, or `per session` |
+| `Notes` | why a fallback happened (`—` when none) |
+| `Planning (ms)` | time spent planning (snapshot, extents) |
+| `Oracle SQL` | the statement of the first unit, binds inlined |
+
+### Oracle privileges
+
+For the reading user:
+
+| Privilege | Effect |
+|---|---|
+| `SELECT` on the tables | required |
+| `SELECT ON SYS.DBA_EXTENTS` | best splitting (without it, `DBMS_PARALLEL_EXECUTE` is tried) |
+| `EXECUTE ON SYS.DBMS_FLASHBACK` | consistent parallel reads (`SELECT ON V_$DATABASE` also works) |
+
+### Read types
+
+| Oracle | DuckDB |
+|---|---|
+| `NUMBER(p,0)`, p ≤ 18 | `SMALLINT` (p ≤ 4), `INTEGER` (p ≤ 9), `BIGINT` |
+| other `NUMBER(p,s)` | `DECIMAL(p,s)` |
+| `NUMBER(*,0)` | `DECIMAL(38,0)` |
+| `NUMBER(p,s)`, negative scale | exact `DECIMAL(p-s,0)` |
+| `p-s` > 38 or `s` > 38 | `DOUBLE` (digits may be lost) |
+| `NUMBER`, `FLOAT` without precision | `unconstrained_number`: `DOUBLE` by default (digits beyond about 15 are lost), `VARCHAR`, or `DECIMAL(p,s)` |
+| `BINARY_FLOAT`, `BINARY_DOUBLE` | `FLOAT`, `DOUBLE` |
+| `DATE` | `TIMESTAMP` |
+| `TIMESTAMP(n)` | `TIMESTAMP` (nanoseconds truncated to microseconds) |
+| `TIMESTAMP WITH [LOCAL] TIME ZONE` | `TIMESTAMPTZ` |
+| `VARCHAR2`, `CHAR`, `NVARCHAR2`, `NCHAR`, `CLOB`, `NCLOB` | `VARCHAR` (UTF-8, validated; `CHAR` padding is kept; `EMPTY_CLOB()` reads as `''`) |
+| `RAW`, `BLOB` | `BLOB` |
+| `ROWID`, `UROWID` | `VARCHAR` |
+| `LONG`, `LONG RAW`, `XMLTYPE`, `JSON`, `VECTOR`, `BFILE`, `INTERVAL`, object types | error, only when the column is selected |
+
+An unsupported column is part of the table: `SELECT other_columns` works, and
+`SELECT *` fails with `column "X" has Oracle type XMLTYPE, which oraduck_scan
+does not read`.
+
+### Network
+
+On a production link, the network is the bottleneck. SQL\*Net compression and
+the session data unit (SDU) go in the DSN as a connect descriptor:
+
+```sql
+CREATE SECRET oracle_prod (TYPE oraduck, USER '...', PASSWORD '...',
+  DSN '(DESCRIPTION=(COMPRESSION=on)(SDU=2097152)(ADDRESS=(PROTOCOL=TCP)(HOST=dbhost)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=SERVICE)))');
+```
+
+SQL\*Net compression requires the Oracle Advanced Compression option licence.
+
+### Read limits
+
+- Ctrl-C and `max_execution_time` are honoured between two fetches: a single
+  slow fetch (a heavy view) finishes first.
+- Temporary LOBs created by views that compute CLOBs are released at the end
+  of the query.
+- Without an SCN, a table read twice in one query (a self join, a CTE used
+  twice) may see two Oracle snapshots.
+- Rows come in no particular order: units are read in parallel.
+- Each DuckDB release needs a matching OraDuck build: C++ extensions are tied
+  to the exact DuckDB version, and the stable C API cannot push filters.
+
+### Read benchmark
+
+<!-- READ BENCHMARK SUMMARY: filled after the campaign (bench/REPORT_READ.md) -->
 
 ## Tests
 

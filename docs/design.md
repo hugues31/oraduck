@@ -24,6 +24,7 @@ The project ships:
 
 ### In scope (v1)
 
+- Reading Oracle tables, views and synonyms: a read-only `ATTACH '' AS ora (TYPE oraduck, SECRET …)` and the `oraduck_scan` table function (section 4.4).
 - `COPY (<query>) TO '<SCHEMA.TABLE>' (FORMAT ORADUCK, CONNECTION '<secret>')`.
 - An `oraduck` DuckDB secret type holding the Oracle credentials.
 - Parallel load: one OCI Direct Path session per DuckDB thread.
@@ -34,7 +35,7 @@ The project ships:
 
 ### Out of scope (v1)
 
-- Reading from Oracle (scanner), `ATTACH`, `INSERT INTO` an Oracle database.
+- `INSERT INTO` an Oracle database, and any write through `ATTACH` (the attached database is read-only; reading is described in section 4.4).
 - Creating or altering tables (DDL): the target table must exist.
 - UPDATE / MERGE / upsert.
 - LOBs (CLOB, BLOB), NVARCHAR2 / NCHAR, nested types (LIST, STRUCT, MAP),
@@ -129,6 +130,20 @@ is rejected: DuckDB would otherwise replace it with a temporary file.
 | Copy function       | DuckDB copy function callbacks (bind, global init, prepare batch, flush batch, finalize). |
 | `OracleError`       | Wraps `OCIErrorGet` output: ORA code and text, plus the column and row when available. |
 
+The read path adds these components (section 4.4):
+
+| Component | Responsibility |
+|---|---|
+| Describe source (`describe_source`) | Resolves `[SCHEMA.]NAME` (table, view, synonym chain, public synonym) and describes its columns, the database character set and the row estimate. |
+| Type mapping (`read_types`) | Oracle column to DuckDB type and fetch decoder; the `unconstrained_number` setting. |
+| Filter translation (`filter_sql`) | DuckDB filter tree to an Oracle `WHERE` fragment with binds; refuses anything not provably equivalent. |
+| Scan SQL (`read_sql`, `sql_binds`) | The statement of a work unit: projection, pushed filters, `AS OF SCN`, slice predicate, bind values. |
+| ROWID ranges (`rowid_ranges`) | ROWID range slices from extents: sizing and the ROWID bounds. |
+| Work planning (`work_units`) | Snapshot SCN, split strategy (`extents`, `hash`, `none`) and fallbacks: the work plan of a scan. |
+| Fetch cursor (`fetch_cursor`) | One statement on one session: defines, array fetch, LOB prefetch. |
+| Scan glue (`oraduck_scan`, `oraduck_scan_filters`, `scan_vectors`) | The `oraduck_scan` table function: bind, plan, one session per thread, vectors, `EXPLAIN` output, filter pushdown. |
+| Catalog (`oraduck_catalog*`) | The `oraduck` storage extension: read-only catalog, schemas = Oracle users, lazily described tables. |
+
 ### 4.2 How a COPY runs
 
 1. **Bind** (single thread)
@@ -195,6 +210,20 @@ passed to OCI double-quoted, otherwise OCI upper-cases them (ORA-39826).
 Zero-copy pointers target the memory of the batch's vectors, including short
 strings (≤ 12 bytes) stored inside the `string_t` itself: they stay valid until
 the conversion into the stream, which happens within the same `prepare_batch`.
+
+### 4.4 Read path
+
+Reading is the mirror of the load: `ATTACH '' AS ora (TYPE oraduck, SECRET s)`
+or `oraduck_scan('[SCHEMA.]TABLE', connection := 's')` describes the source at
+bind time, plans the work when the query starts, then fetches the work units
+(ROWID ranges or hash buckets) in parallel, one Oracle session per DuckDB
+thread, each statement running `AS OF SCN` of one common SCN when the user may
+read it. Projections are pushed; filters are pushed only when the translation
+is provably equivalent in Oracle, the others stay in DuckDB. User documentation:
+the README section "Read from Oracle".
+
+- Design and decisions: [`docs/superpowers/specs/2026-10-23-oracle-read-design.md`](superpowers/specs/2026-10-23-oracle-read-design.md).
+- OCI measurements behind the fetch choices: [`docs/probe-results.md`](probe-results.md), section "Read path".
 
 ## 5. Type mapping
 
