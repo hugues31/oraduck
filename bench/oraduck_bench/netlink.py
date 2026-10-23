@@ -47,17 +47,44 @@ def parse_delay_us(text: str | None) -> int | None:
     return round(float(match[1]) * _DELAY_US[match[2]]) if match else None
 
 
+STATE_HEADER = re.compile(r"^# pid=(\d+) started=(\S+)\n")
+_state_note: str | None = None
+
+
+def _container_identity(container: str = ORACLE_CONTAINER) -> str:
+    return _docker("inspect", "-f", "{{.State.Pid}} {{.State.StartedAt}}", container).strip()
+
+
+def read_state(text: str, identity: str) -> tuple[str | None, str | None]:
+    """(qdiscs, problem): the recorded qdiscs when the state file was written for the running container (same
+    pid and start time), else None and why."""
+    match = STATE_HEADER.match(text)
+    if not match:
+        return None, "the recorded shaping has no container identity: run `sudo ./infra/net/shape.sh on` again"
+    if f"{match[1]} {match[2]}" != identity:
+        return None, ("the container was restarted since `shape.sh on` (its eth0 qdiscs are gone): "
+                      "run `sudo ./infra/net/shape.sh on` again")
+    return text[match.end():], None
+
+
 def _container_qdiscs(container: str = ORACLE_CONTAINER) -> str | None:
-    """The container's eth0 qdiscs: read live when we may enter the namespace, else as recorded by `shape.sh on`."""
+    """The container's eth0 qdiscs: read live when we may enter the namespace, else as recorded by `shape.sh on`
+    for this very container instance."""
+    global _state_note
+    _state_note = None
     try:
-        pid = _docker("inspect", "-f", "{{.State.Pid}}", container).strip()
+        identity = _container_identity(container)
+        pid = identity.split()[0]
         proc = subprocess.run(["nsenter", "-t", pid, "-n", "tc", "qdisc", "show", "dev", "eth0"], text=True,
                               capture_output=True)
         if proc.returncode == 0:
             return proc.stdout
     except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-    return SHAPING_STATE.read_text() if SHAPING_STATE.exists() else None
+        return None
+    if not SHAPING_STATE.exists():
+        return None
+    text, _state_note = read_state(SHAPING_STATE.read_text(), identity)
+    return text
 
 
 def _bridge_qdiscs() -> str | None:
@@ -69,16 +96,27 @@ def _bridge_qdiscs() -> str | None:
 
 
 def shaping_status(container_text: str | None = ..., bridge_text: str | None = ...) -> dict:
-    """Parsed `tc qdisc show` of both directions; the texts are read from the system when not given."""
+    """Parsed `tc qdisc show` of both directions; the texts are read from the system when not given. `note` says
+    why the container side is unknown when the recorded shaping belongs to another container instance."""
+    note = None
     if container_text is ...:
         container_text = _container_qdiscs()
+        note = _state_note
     if bridge_text is ...:
         bridge_text = _bridge_qdiscs()
-    return {"rate_bps": parse_rate_bps(container_text), "container_delay_us": parse_delay_us(container_text),
-            "bridge_delay_us": parse_delay_us(bridge_text)}
+    status = {"rate_bps": parse_rate_bps(container_text), "container_delay_us": parse_delay_us(container_text),
+              "bridge_delay_us": parse_delay_us(bridge_text)}
+    if note:
+        status["note"] = note
+    return status
 
 
 def is_line_rate_shaped(status: dict) -> bool:
     """The 1 Gbit/s qdisc is set on the container side, and both directions carry a delay."""
     return (status.get("rate_bps") == LINE_RATE_BPS and bool(status.get("container_delay_us"))
             and bool(status.get("bridge_delay_us")))
+
+
+def bridge_delay_us() -> int | None:
+    """The netem delay left on the Oracle bridge (None when there is none or it cannot be read)."""
+    return parse_delay_us(_bridge_qdiscs())

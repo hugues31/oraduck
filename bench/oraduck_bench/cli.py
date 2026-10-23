@@ -8,7 +8,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from . import netlink, read_methods, read_runner, runner
+from . import duck, netlink, read_methods, read_runner, runner
 from .config import (COLS, RESULTS, ROWS, SCALING_CASE, SCALING_THREADS, THREADS, TUNE_STREAM_SIZES,
                      OracleConfig)
 from .read_config import READ_CASES, READ_COMPETITOR_RUNS, READ_COMPETITOR_SERIES, READ_RUNS
@@ -50,6 +50,7 @@ def _read_external(args: argparse.Namespace) -> int:
     password = os.environ.get("ORADUCK_EXTERNAL_PASSWORD")
     if not password:
         raise SystemExit("ORADUCK_EXTERNAL_PASSWORD is not set")
+    duck.add_secret(password)
     cfg = OracleConfig(args.user, password, args.dsn)
     try:
         runs = [read_methods.run_oraduck(cfg, args.table, 8, args.where) for _ in range(args.runs)]
@@ -62,6 +63,11 @@ def _read_external(args: argparse.Namespace) -> int:
     print(f"median {median:.3f} s: {rows / median:,.0f} rows/s, {size / median / 1e6:,.1f} MB/s of DuckDB storage "
           f"({rows:,} rows, {size / 1e6:,.0f} MB)")
     return 0
+
+
+def default_read_results(directory: Path = RESULTS) -> list[Path]:
+    """Read result files for the report: the smoke runs (one unrepresentative run) are left out."""
+    return sorted(p for p in directory.glob("*read*.jsonl") if not p.name.endswith("-read-smoke.jsonl"))
 
 
 def compression_dsn(dsn: str) -> str:
@@ -87,7 +93,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("smoke", "tune", "scaling", "matrix", "competitors", "read-smoke", "read-compression"):
         sub.add_parser(name)
-    for name in ("read-matrix", "read-competitors", "read-shaped"):
+    shaped_parser = sub.add_parser("read-shaped")  # always 1M x 550: no --only
+    shaped_parser.add_argument("--runs", type=int, default=None, help="measured runs per method")
+    for name in ("read-matrix", "read-competitors"):
         read_parser = sub.add_parser(name)
         read_parser.add_argument("--only", action="append", default=[], metavar="ROWSxCOLS",
                                  help="run only this case (repeatable)")
@@ -113,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "read-report":
         from . import read_report
 
-        print(read_report.write_read_report(args.files or sorted(RESULTS.glob("*read*.jsonl"))))
+        print(read_report.write_read_report(args.files or default_read_results()))
         return 0
 
     if args.command == "read-external":
@@ -123,10 +131,16 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--runs must be at least 1")
     only = parse_only(args.only) if hasattr(args, "only") else []
     shaping = None
+    if args.command in ("read-smoke", "read-matrix", "read-competitors", "read-compression"):
+        leftover = netlink.bridge_delay_us()
+        if leftover:
+            raise SystemExit(f"the Oracle bridge still has a netem delay ({leftover} us): this run would be "
+                             "slowed down but labelled local. Run `sudo ./infra/net/shape.sh off` first")
     if args.command == "read-shaped":
         shaping = netlink.shaping_status()
         if not netlink.is_line_rate_shaped(shaping):
-            raise SystemExit(f"the link is not shaped to 1 Gbit/s ({shaping}): run `sudo ./infra/net/shape.sh on` "
+            raise SystemExit(f"the link is not shaped to 1 Gbit/s ({shaping}"
+                             f"{'; ' + shaping['note'] if shaping.get('note') else ''}): run `sudo ./infra/net/shape.sh on` "
                              "and check `./infra/net/shape.sh status`")
     _check_affinity()
     cfg = OracleConfig.from_env()

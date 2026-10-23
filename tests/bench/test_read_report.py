@@ -47,8 +47,8 @@ def test_four_tables_utilisation_and_criteria(tmp_path):
     text = report(tmp_path, rows())
     assert "## Matrix" in text and "## Competitors" in text and "## Shaped to 1 Gbit/s" in text
     assert "## Planning" in text
-    assert "100.0 %" in text
-    assert "| OraDuck | 1,000,000 | 550 | 1.100 |" in text or "1.100" in text
+    assert "100.0 %" in text and "upper bound" in text and "merged into one median" in text
+    assert "| OraDuck | 8 | 1,000,000 | 550 | 1.100 | 1.000–1.200 |" in text
     assert "×2.0" in text
     assert "fastest on every case" in text and "met" in text.split("fastest on every case")[1].splitlines()[0]
     assert "## Analysis" in text

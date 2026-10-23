@@ -81,3 +81,62 @@ def test_read_shaped_refuses_an_unshaped_link(monkeypatch):
     monkeypatch.setattr(netlink, "shaping_status", lambda: {"rate_bps": None})
     with pytest.raises(SystemExit, match="not shaped"):
         cli.main(["read-shaped"])
+
+
+def test_stale_state_is_rejected():
+    ident = "4242 2026-10-24T01:00:00Z"
+    ok, problem = netlink.read_state(f"# pid=4242 started=2026-10-24T01:00:00Z\n{CONTAINER}", ident)
+    assert ok == CONTAINER and problem is None
+    for text in (f"# pid=4243 started=2026-10-24T01:00:00Z\n{CONTAINER}",
+                 f"# pid=4242 started=2026-10-24T09:00:00Z\n{CONTAINER}", CONTAINER):
+        shaped, problem = netlink.read_state(text, ident)
+        assert shaped is None and "run `sudo ./infra/net/shape.sh on` again" in problem
+
+
+def test_shaping_status_ignores_a_state_file_of_another_container(tmp_path, monkeypatch):
+    state = tmp_path / "shaping.state"
+    state.write_text(f"# pid=1 started=old\n{CONTAINER}")
+    monkeypatch.setattr(netlink, "SHAPING_STATE", state)
+    monkeypatch.setattr(netlink, "_docker", lambda *a: "2 new\n" if a[0] == "inspect" else "4659088bcdd2\n")
+    monkeypatch.setattr(netlink.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "denied"))
+    status = netlink.shaping_status(bridge_text=BRIDGE)
+    assert not netlink.is_line_rate_shaped(status) and "restarted" in status["note"]
+    state.write_text(f"# pid=2 started=new\n{CONTAINER}")
+    assert netlink.is_line_rate_shaped(netlink.shaping_status(bridge_text=BRIDGE))
+
+
+def test_shape_script_off_works_without_the_container(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker = bin_dir / "docker"
+    docker.write_text('#!/bin/sh\ncase "$1" in network) echo 4659088bcdd2;; inspect) echo 0;; esac\n')
+    docker.chmod(docker.stat().st_mode | stat.S_IEXEC)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    proc = subprocess.run([str(ROOT / "infra/net/shape.sh"), "off", "--dry-run"], env=env, capture_output=True,
+                          text=True)
+    assert proc.returncode == 0
+    assert "tc qdisc del dev br-4659088bcdd2 root" in proc.stdout and "not running" in proc.stderr
+    assert "nsenter" not in proc.stdout
+
+
+def test_local_runs_refuse_a_shaped_bridge(monkeypatch):
+    import pytest
+    from oraduck_bench import cli
+    monkeypatch.setattr(netlink, "bridge_delay_us", lambda: 250)
+    for command in ("read-smoke", "read-matrix", "read-competitors", "read-compression"):
+        with pytest.raises(SystemExit, match="netem delay"):
+            cli.main([command])
+
+
+def test_read_shaped_takes_no_only():
+    import pytest
+    from oraduck_bench import cli
+    with pytest.raises(SystemExit):
+        cli.main(["read-shaped", "--only", "1000000x50"])
+
+
+def test_default_read_report_inputs_leave_out_smoke_runs(tmp_path):
+    from oraduck_bench import cli
+    for name in ("a-read-smoke.jsonl", "b-read-matrix.jsonl", "c-read-shaped.jsonl", "d-matrix.jsonl"):
+        (tmp_path / name).write_text("")
+    assert [p.name for p in cli.default_read_results(tmp_path)] == ["b-read-matrix.jsonl", "c-read-shaped.jsonl"]

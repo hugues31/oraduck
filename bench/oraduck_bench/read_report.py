@@ -184,7 +184,9 @@ def _competitors_section(local: dict[Group, list[dict]], events: list[dict], out
     lines = ["## Competitors (unconstrained local link)", "",
              f"Median of {READ_COMPETITOR_RUNS} runs after one warm-up run, methods interleaved, checksums compared "
              "with Oracle's after every run: only methods that load identical data are ranked. Speedup = method "
-             "median / OraDuck (N = 8) median. Each method ran in the DuckDB version of its column.", ""]
+             "median / OraDuck (N = 8) median. Each method ran in the DuckDB version of its column. Runs of the same "
+             "method and case from several result files (read-matrix and read-competitors) are merged into one "
+             "median.", ""]
     others = [e for e in events if network(e) == "local"]
     if not any(k[2] != "oraduck" or k[3] != 8 for k in local) and not others:
         return lines + ["No competitor measurement.", ""]
@@ -245,7 +247,9 @@ def _shaped_section(shaped: dict[Group, list[dict]], local: dict[Group, list[dic
                     out_dir: Path) -> list[str]:
     lines = ["## Shaped to 1 Gbit/s", "",
              "Utilisation = bytes received on the Oracle bridge during a run / total time / 125 MB/s (the link "
-             "carries Oracle's traffic only; the total includes connection and planning time). Median over the runs.",
+             "carries Oracle's traffic only; the total includes connection and planning time). The byte window brackets the "
+             "whole method call, untimed set-up and checks included, and counts all traffic received on the bridge: "
+             "the utilisation is an upper bound. Median over the runs.",
              ""]
     if not shaped:
         return lines + ["No shaped run (`sudo ./infra/net/shape.sh on`, then `oraduck-bench read-shaped`).", ""]

@@ -253,3 +253,21 @@ def test_planning_is_parsed_from_explain_analyze():
     out = "│  Extra Info:  │\n│ Planning (ms): 12.75 │\n"
     assert read_methods.parse_planning_ms(out) == 12.75
     assert read_methods.parse_planning_ms("nothing") is None
+
+
+def test_run_error_path_masks_the_known_password(tmp_path, monkeypatch):
+    import stat
+    import pytest
+    from oraduck_bench import duck
+    cli = tmp_path / "fakeduck"
+    cli.write_text("#!/bin/sh\necho 'ORA-01017: invalid user Pw@1/x for oracle://u:Pw%401%2Fx@h/s' >&2\nexit 1\n")
+    cli.chmod(cli.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setattr(duck, "DUCKDB_CLI", cli)
+    monkeypatch.setattr(duck, "WORK", tmp_path)
+    duck.add_secret("Pw@1/x")
+    try:
+        with pytest.raises(duck.DuckDBError) as err:
+            duck.run("SELECT 1; CREATE SECRET s (TYPE oraduck, PASSWORD 'Pw@1/x');")
+    finally:
+        duck.forget_secrets()
+    assert "Pw" not in str(err.value) and "1/x" not in str(err.value) and "ORA-01017" in str(err.value)
