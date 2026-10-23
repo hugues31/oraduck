@@ -19,6 +19,7 @@ typedef unsigned int ub4;
 typedef signed int sb4;
 typedef signed int sword;
 typedef long long sb8;
+typedef unsigned long long ub8;
 typedef unsigned char OraText;
 
 // Opaque handles
@@ -29,6 +30,8 @@ struct OCIStmt;
 struct OCIBind;
 struct OCIDefine;
 struct OCIParam;
+struct OCILobLocator;
+struct OCIDateTime;
 struct OCISnapshot;
 struct OCIDirPathCtx;
 struct OCIDirPathColArray;
@@ -65,7 +68,9 @@ constexpr ub4 OCI_HTYPE_DEFINE = 6;
 constexpr ub4 OCI_HTYPE_DIRPATH_CTX = 14;
 constexpr ub4 OCI_HTYPE_DIRPATH_COLUMN_ARRAY = 15;
 constexpr ub4 OCI_HTYPE_DIRPATH_STREAM = 16;
+constexpr ub4 OCI_DTYPE_LOB = 50;
 constexpr ub4 OCI_DTYPE_PARAM = 53;
+constexpr ub4 OCI_DTYPE_TIMESTAMP = 68;
 
 // Attributes
 constexpr ub4 OCI_ATTR_DATA_SIZE = 1;
@@ -86,6 +91,8 @@ constexpr ub4 OCI_ATTR_NUM_COLS = 102;
 constexpr ub4 OCI_ATTR_LIST_COLUMNS = 103;
 constexpr ub4 OCI_ATTR_DIRPATH_SKIPINDEX_METHOD = 145;
 constexpr ub4 OCI_ATTR_ROWS_FETCHED = 197;
+constexpr ub4 OCI_ATTR_LOBPREFETCH_SIZE = 439;   // define handle: LOB bytes (BLOB) or characters (CLOB) prefetched
+constexpr ub4 OCI_ATTR_LOBPREFETCH_LENGTH = 440; // define handle: prefetch the LOB length and chunk size (int boolean)
 
 // Character set forms (OCI_ATTR_CHARSET_FORM)
 constexpr ub1 SQLCS_IMPLICIT = 1;
@@ -120,6 +127,9 @@ constexpr ub2 kInternalTimestamp = 180; // internal TIMESTAMP type (not document
 // Callback of a dynamic define (OCIDefineDynamic): supplies the buffer of each piece
 typedef sb4 (*OCICallbackDefine)(void *octxp, OCIDefine *defnp, ub4 iter, void **bufpp, ub4 **alenp, ub1 *piecep,
                                  void **indp, ub2 **rcodep);
+// Callback of a piecewise LOB read (OCILobRead2)
+typedef sb4 (*OCICallbackLobRead2)(void *ctxp, const void *bufp, ub8 len, ub1 piece, void **changed_bufpp,
+                                   ub8 *changed_lenp);
 
 struct OciApi {
 	sword (*OCIEnvNlsCreate)(OCIEnv **envp, ub4 mode, void *ctxp, void *(*malocfp)(void *ctxp, size_t size),
@@ -128,6 +138,7 @@ struct OciApi {
 	                         ub2 charset, ub2 ncharset);
 	sword (*OCIHandleAlloc)(const void *parenth, void **hndlpp, ub4 type, size_t xtramem_sz, void **usrmempp);
 	sword (*OCIHandleFree)(void *hndlp, ub4 type);
+	sword (*OCIDescriptorAlloc)(const void *parenth, void **descpp, ub4 type, size_t xtramem_sz, void **usrmempp);
 	sword (*OCIDescriptorFree)(void *descp, ub4 type);
 	sword (*OCIAttrGet)(const void *trgthndlp, ub4 trghndltyp, void *attributep, ub4 *sizep, ub4 attrtype,
 	                    OCIError *errhp);
@@ -157,6 +168,13 @@ struct OciApi {
 	sword (*OCIDefineDynamic)(OCIDefine *defnp, OCIError *errhp, void *octxp, OCICallbackDefine ocbfp);
 	sword (*OCIBreak)(void *hndlp, OCIError *errhp);
 	sword (*OCIReset)(void *hndlp, OCIError *errhp);
+	sword (*OCILobGetLength2)(OCISvcCtx *svchp, OCIError *errhp, OCILobLocator *locp, ub8 *lenp);
+	sword (*OCILobRead2)(OCISvcCtx *svchp, OCIError *errhp, OCILobLocator *locp, ub8 *byte_amtp, ub8 *char_amtp,
+	                     ub8 offset, void *bufp, ub8 bufl, ub1 piece, void *ctxp, OCICallbackLobRead2 cbfp, ub2 csid,
+	                     ub1 csfrm);
+	sword (*OCIDateTimeGetDate)(void *hndl, OCIError *err, const OCIDateTime *date, sb2 *year, ub1 *month, ub1 *day);
+	sword (*OCIDateTimeGetTime)(void *hndl, OCIError *err, OCIDateTime *datetime, ub1 *hour, ub1 *minute, ub1 *sec,
+	                            ub4 *fsec);
 	sword (*OCIDirPathPrepare)(OCIDirPathCtx *dpctx, OCISvcCtx *svchp, OCIError *errhp);
 	sword (*OCIDirPathColArrayEntrySet)(OCIDirPathColArray *dpca, OCIError *errhp, ub4 rownum, ub2 col_idx,
 	                                    ub1 *cvalp, ub4 clen, ub1 cflg);
