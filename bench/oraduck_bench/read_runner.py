@@ -56,10 +56,19 @@ def run_read_case(
     duck_checksums: Callable = duck_checksums,
     duck_checksums_cast: Callable = duck_checksums_cast,
     oracle_checksums: Callable = oracle_checksums,
+    link_counter: Callable[[], int] | None = None,
+    shaping: dict | None = None,
+    variant: str | None = None,
+    planning: Callable | None = None,
 ) -> list[dict]:
     """One warm-up round (unless warmup is false) then `runs` interleaved rounds of `methods`. A method that
     exceeds timeout_s is added to `timeouts` and is no longer run on cases at least as large. Oracle's checksums
-    are computed once (the data does not change); DuckDB's are compared after every run."""
+    are computed once (the data does not change); DuckDB's are compared after every run.
+    `link_counter` returns the bytes received on the Oracle link: its difference around a run fills `link_bytes`.
+    `shaping` (the parsed qdiscs) and `variant` (for example "compression") are copied to every record; `planning`
+    (cfg, table, threads, where) returns the OraDuck planning time in ms, recorded once after the runs."""
+    duck.add_secret(cfg.password)
+    tags = {**({"shaping": shaping} if shaping else {}), **({"variant": variant} if variant else {})}
     where = where or default_where()
     timeouts = timeouts if timeouts is not None else set()
     table = ensure(cfg, nrows, ncols)
@@ -69,7 +78,7 @@ def run_read_case(
     active = []
     for method in methods:
         if competitors.should_skip(timeouts, method, nrows, ncols):
-            records.append(_append(out, {"type": "skipped", **case, "method": method, "threads": threads}))
+            records.append(_append(out, {"type": "skipped", **case, "method": method, "threads": threads, **tags}))
             print(f"{READ_SUITE} {table} {method} N={threads}: not run", flush=True)
         else:
             active.append(method)
@@ -81,12 +90,15 @@ def run_read_case(
                     continue
                 at = time.strftime("%Y-%m-%dT%H:%M:%S")
                 try:
+                    link_before = link_counter() if link_counter else None
                     m = run_method(cfg, method, table, threads, where, timeout_s)
+                    if link_counter:
+                        m = replace(m, link_bytes=link_counter() - link_before)
                 except duck.MethodTimeout:
                     timeouts.add((method, nrows, ncols))
                     active.remove(method)
                     records.append(_append(out, {"type": "timeout", **case, "method": method, "threads": threads,
-                                                 "warmup": is_warmup, "limit_s": timeout_s, "at": at}))
+                                                 "warmup": is_warmup, "limit_s": timeout_s, "at": at, **tags}))
                     print(f"{READ_SUITE} {table} {method} N={threads}: stopped after {timeout_s} s", flush=True)
                     continue
                 except duck.DuckDBError as exc:  # a competitor that cannot do the case; OraDuck failing is a bug
@@ -94,13 +106,13 @@ def run_read_case(
                         raise
                     active.remove(method)
                     records.append(_append(out, {"type": "error", **case, "method": method, "threads": threads,
-                                                 "warmup": is_warmup, "message": str(exc)[:2000], "at": at}))
+                                                 "warmup": is_warmup, "message": str(exc)[:2000], "at": at, **tags}))
                     print(f"{READ_SUITE} {table} {method} N={threads}: failed: {str(exc)[:300]}", flush=True)
                     continue
                 if m.extra.get("skipped"):
                     active.remove(method)
                     records.append(_append(out, {"type": "skipped", **case, "method": method, "threads": threads,
-                                                 "reason": m.extra["skipped"], "at": at}))
+                                                 "reason": m.extra["skipped"], "at": at, **tags}))
                     print(f"{READ_SUITE} {table} {method} N={threads}: skipped ({m.extra['skipped']})", flush=True)
                     continue
                 cast = False
@@ -118,14 +130,20 @@ def run_read_case(
                     active.remove(method)
                     records.append(_append(out, {"type": "mismatch", **case, "method": method, "threads": threads,
                                                  "warmup": is_warmup, "message": message, "total_s": m.total_s,
-                                                 "extra": m.extra, "at": at}))
+                                                 "extra": m.extra, "at": at, **tags}))
                     print(f"{READ_SUITE} {table} {method} N={threads}: wrong data, not timed ({message})", flush=True)
                     continue
                 m = replace(m, nrows=nrows, ncols=ncols)
                 records.append(_append(out, {"type": "measure", "suite": READ_SUITE, "index": round_index,
-                                             "warmup": is_warmup, "at": at, "checksum_cast": cast, **asdict(m)}))
+                                             "warmup": is_warmup, "at": at, "checksum_cast": cast, **tags, **asdict(m)}))
                 print(f"{READ_SUITE} {table} {method} N={threads}{' (warm-up)' if is_warmup else ''}: "
                       f"{m.total_s:.3f} s{' (checksums on casts)' if cast else ''}", flush=True)
+        if planning is not None and any(r["type"] == "measure" and r["method"].startswith("oraduck")
+                                        for r in records):
+            ms = planning(cfg, table, threads, where)
+            if ms is not None:
+                records.append(_append(out, {"type": "planning", **case, "threads": threads, "planning_ms": ms,
+                                             **tags}))
     finally:
         read_methods.reset_out_db()
     return records

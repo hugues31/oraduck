@@ -22,7 +22,7 @@ def new_results_file(cfg: OracleConfig, suite: str) -> Path:
     env = env_info.collect(cfg)
     if suite == "competitors":
         env["competitors"] = competitors.versions()
-    elif suite == "read-competitors":
+    elif suite in ("read-competitors", "read-shaped"):
         from . import read_methods
 
         env["competitors"] = read_methods.versions()

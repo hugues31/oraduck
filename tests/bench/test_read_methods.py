@@ -233,3 +233,23 @@ def test_fallback_row_estimate_without_statistics(monkeypatch):
     with pytest.raises(duck.DuckDBError) as err:
         read_methods._estimated_row_bytes(CFG, "RD_10_50")
     assert "pw" not in str(err.value).replace("PASSWORD", "")
+
+
+def test_redaction_masks_literal_secrets_before_the_patterns():
+    from oraduck_bench import duck
+    text = ("CREATE SECRET s (TYPE oraduck, PASSWORD 'Pw@1/x', DSN 'h'); user/Pw@1/x@h:1/s "
+            "oracle://u:Pw@1/x@h:1/s")
+    out = duck.redact(text, ("Pw@1/x",))
+    assert "Pw" not in out and "1/x" not in out
+    # registered secrets apply without being passed
+    duck.add_secret("Zz@9/q")
+    try:
+        assert "Zz" not in duck.redact("PASSWORD 'Zz@9/q' and Zz@9/q")
+    finally:
+        duck.forget_secrets()
+
+
+def test_planning_is_parsed_from_explain_analyze():
+    out = "│  Extra Info:  │\n│ Planning (ms): 12.75 │\n"
+    assert read_methods.parse_planning_ms(out) == 12.75
+    assert read_methods.parse_planning_ms("nothing") is None

@@ -29,17 +29,32 @@ _CONNECT_STRING = re.compile(r"([\w$#.-]+/)[^\s@'\"/]+(@)")
 _URL_CREDENTIALS = re.compile(r"([a-z][a-z0-9+.-]*://[^\s:/@'\"]+:)[^\s@'\"]+(@)", re.IGNORECASE)
 
 
+_known_secrets: set[str] = set()
+
+
+def add_secret(secret: str | None) -> None:
+    """Registers a password: every error message built by this module masks it."""
+    if secret:
+        _known_secrets.add(secret)
+
+
+def forget_secrets() -> None:
+    _known_secrets.clear()
+
+
 def redact(text: str, secrets: tuple[str, ...] = ()) -> str:
-    """Hides the passwords of CREATE SECRET statements, of user/password@dsn and scheme://user:password@host
-    strings, and every literal value of `secrets` (also when URL-encoded)."""
+    """Hides every literal value of `secrets` and of the registered secrets (also when URL-encoded), first, so a
+    password containing `@` or `/` is not cut by a pattern; then the passwords of CREATE SECRET statements, of
+    user/password@dsn and of scheme://user:password@host strings."""
     from urllib.parse import quote
 
-    text = _URL_CREDENTIALS.sub(r"\1***\2", _CONNECT_STRING.sub(r"\1***\2", _PASSWORD.sub(r"\1***\2", text)))
-    for secret in secrets:
+    forms = set()
+    for secret in (*secrets, *_known_secrets):
         if secret:
-            for form in {secret, quote(secret, safe="")}:
-                text = text.replace(form, "***")
-    return text
+            forms.update((secret, quote(secret, safe="")))
+    for form in sorted(forms, key=len, reverse=True):
+        text = text.replace(form, "***")
+    return _URL_CREDENTIALS.sub(r"\1***\2", _CONNECT_STRING.sub(r"\1***\2", _PASSWORD.sub(r"\1***\2", text)))
 
 
 class DuckDBError(RuntimeError):
@@ -51,7 +66,7 @@ class MethodTimeout(DuckDBError):
 
 
 def run(sql: str, db: Path | str = ":memory:", csv_output: bool = False, timeout_s: float | None = None,
-        unsigned: bool = False, cli: Path | None = None) -> str:
+        unsigned: bool = False, cli: Path | None = None, secrets: tuple[str, ...] = ()) -> str:
     """`cli` selects another DuckDB CLI (the v1.5.5 one for extensions not built for 2.0)."""
     cli = cli or DUCKDB_CLI
     args = [str(cli), "-batch", "-bail"]
@@ -69,7 +84,7 @@ def run(sql: str, db: Path | str = ":memory:", csv_output: bool = False, timeout
         raise MethodTimeout(f"duckdb killed after {timeout_s} s") from exc
     if proc.returncode != 0:
         raise DuckDBError(redact(
-            f"duckdb failed ({proc.returncode}):\n{proc.stderr.strip()}\n--- script ---\n{sql[:2000]}"))
+            f"duckdb failed ({proc.returncode}):\n{proc.stderr.strip()}\n--- script ---\n{sql[:2000]}", secrets))
     return strip_warnings(proc.stdout)
 
 

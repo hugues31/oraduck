@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -321,6 +322,29 @@ def run_sqlplus_csv(cfg, table, threads, where, timeout_s=READ_TIMEOUT_S) -> Mea
              "timed": f"{TIMED_SCOPE}: sqlplus process start + connect + spool to CSV, then read_csv CTAS "
                       "(start-up cannot be separated)"}
     return Measurement("sqlplus_csv", table, 0, 0, threads, spool_s + load_s, None, extra)
+
+
+_PLANNING = re.compile(r"Planning \(ms\):\s*([0-9]+(?:\.[0-9]+)?)")
+
+
+def parse_planning_ms(output: str) -> float | None:
+    """`Planning (ms)` of the OraDuck scan in an EXPLAIN ANALYZE output."""
+    match = _PLANNING.search(output)
+    return float(match[1]) if match else None
+
+
+def explain_planning(cfg: OracleConfig, table: str, threads: int, where: str) -> float | None:
+    """One untimed EXPLAIN ANALYZE of the attach read: the planning time reported by the scan, None if absent."""
+    setup, statements = oraduck_sql(cfg, table, threads, where)
+    reset_out_db()
+    try:
+        out = duck.run(f"{setup}\n{statements[0]}\nEXPLAIN ANALYZE SELECT * FROM ora.{_qualified(table)} "
+                       f"WHERE {where};", READ_OUT_DB, timeout_s=READ_TIMEOUT_S)
+    except duck.DuckDBError:
+        return None
+    finally:
+        reset_out_db()
+    return parse_planning_ms(out)
 
 
 def run(cfg: OracleConfig, method: str, table: str, threads: int, where: str,
