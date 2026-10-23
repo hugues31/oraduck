@@ -523,8 +523,10 @@ version matters little here: the time is spent in the Oracle read path.
   `DATE`, `CHAR(1 BYTE)`, a few `CLOB`s (mostly small, some above 4,000
   bytes), some `NUMBER` without precision and `TIMESTAMP`. Exact proportions
   are the builder's call (the real distribution is unknown); NULLs about 5 %.
-- Matrix (target partition): rows ∈ {1M, 7M} × columns ∈ {50, 550}, with
-  7M × 550 as the headline case. The builder may add smaller cases for fast
+- Matrix (target partition): 1M rows × columns ∈ {50, 550}, with 1M × 550 as
+  the headline case (Hugues's decision: larger cases are not needed; 7M × 550
+  would not fit the benchmark laptop, and `read-external` measures the real
+  table on the production database). The builder may add smaller cases for fast
   iterations.
 - Generated with Fakelake and loaded with OraDuck's writer where possible
   (CLOB columns, which the writer does not support, through Oracle-side SQL).
@@ -556,7 +558,7 @@ so that Hugues can run the same measurement on the Exadata (*Claude's call*).
 ### 10.5 Success criteria (*Claude's call*)
 
 - Local: OraDuck is the fastest method on every case of the matrix.
-- Shaped to 1 Gbit/s: on 7M × 550, OraDuck reaches at least 90 % of line rate.
+- Shaped to 1 Gbit/s: on 1M × 550, OraDuck reaches at least 90 % of line rate.
 - Correctness: identical checksums for every method that finishes.
 
 Results are reported as measured, including cases where OraDuck does not win.
