@@ -365,6 +365,17 @@ void OraduckScanGetMetrics(TableFunctionGetMetricsInput &input) {
 	input.operator_metrics.SetExtraInfo(std::move(info));
 }
 
+// The bind data holds the filters pushed to Oracle, whose DuckDB expressions are gone from the plan; a plan copy
+// rebound from the call's arguments would lose them. NotImplementedException: what plan copies (CTE inlining, window
+// self-join, partitioned execution) catch to give up copying.
+void OraduckScanSerialize(Serializer &, const optional_ptr<FunctionData>, const BoundTableFunction &) {
+	throw NotImplementedException("OraDuck: an oraduck_scan plan cannot be serialized");
+}
+
+unique_ptr<FunctionData> OraduckScanDeserialize(Deserializer &, BoundTableFunction &) {
+	throw NotImplementedException("OraDuck: an oraduck_scan plan cannot be deserialized");
+}
+
 bool SameFilters(const std::vector<oraduck::SqlFragment> &a, const std::vector<oraduck::SqlFragment> &b) {
 	if (a.size() != b.size()) {
 		return false;
@@ -486,6 +497,11 @@ TableFunction GetOraduckScanFunction() {
 	function.projection_pushdown = true;
 	// Filters that translate into Oracle SQL go to the Oracle WHERE (partition pruning), the others stay in DuckDB
 	function.pushdown_complex_filter = OraduckScanPushdownComplexFilter;
+	// No plan serialization (the pushed filters live only in the bind data): the common subplan optimizer skips the
+	// scan, plan copies fail and the optimizers that need them give up
+	function.verify_serialization = false;
+	function.SetSerializeCallback(OraduckScanSerialize);
+	function.SetDeserializeCallback(OraduckScanDeserialize);
 	function.filter_pushdown = false;
 	function.filter_prune = false;
 	// Units are read in parallel: the scan does not keep Oracle's row order

@@ -7,7 +7,8 @@ namespace oraduck {
 static const int MAX_SYNONYM_DEPTH = 8;
 
 void PrepareReadSession(OciSession &session) {
-	session.Execute("ALTER SESSION SET NLS_COMP = 'BINARY' NLS_SORT = 'BINARY'");
+	// Gregorian calendar: TIMESTAMP filter constants are bound as text through TO_TIMESTAMP
+	session.Execute("ALTER SESSION SET NLS_COMP = 'BINARY' NLS_SORT = 'BINARY' NLS_CALENDAR = 'GREGORIAN'");
 }
 
 // Looks the object up in ALL_OBJECTS; returns its type ("" when absent).

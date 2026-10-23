@@ -119,7 +119,13 @@ TEST_CASE("Source description: errors", "[oracle][describe_source]") {
 
 TEST_CASE("Read session settings", "[oracle][describe_source]") {
 	OciSession session(TestCredentials());
+	session.Execute("ALTER SESSION SET NLS_CALENDAR = 'Thai Buddha'");
 	PrepareReadSession(session);
 	CHECK(Scalar(session, "SELECT value FROM nls_session_parameters WHERE parameter = 'NLS_COMP'") == "BINARY");
 	CHECK(Scalar(session, "SELECT value FROM nls_session_parameters WHERE parameter = 'NLS_SORT'") == "BINARY");
+	CHECK(Scalar(session, "SELECT value FROM nls_session_parameters WHERE parameter = 'NLS_CALENDAR'") ==
+	      "GREGORIAN");
+	// The text of a TIMESTAMP filter constant reads as a Gregorian date
+	CHECK(Scalar(session, "SELECT TO_CHAR(TO_TIMESTAMP('2024-05-07 10:20:30.123456', 'YYYY-MM-DD HH24:MI:SS.FF6') "
+	                      "- TIMESTAMP '2024-05-07 00:00:00') FROM dual") == "+000000000 10:20:30.123456000");
 }

@@ -25,7 +25,8 @@ struct OracleTableDescription {
 // Throws OraduckError when it does not exist or is not accessible.
 OracleTableDescription DescribeSource(OciSession &session, const TargetName &name);
 
-// Session settings for reading: binary comparison and sorting, so pushed-down filters match DuckDB's semantics.
+// Session settings for reading: binary comparison and sorting and the Gregorian calendar, so pushed-down filters
+// match DuckDB's semantics.
 void PrepareReadSession(OciSession &session);
 
 } // namespace oraduck

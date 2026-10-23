@@ -220,20 +220,18 @@ def reads_during(conn, table: str, sql: str) -> tuple[list[dict], dict[str, int]
     return rows, {name: after[name] - before.get(name, 0) for name in after}
 
 
-def assert_pruned(conn, table: str, sql: str, rows: list[dict], read: set[str], segments: int) -> None:
-    """sql returns rows and reads only the segments in read (logical reads > 0), not the others (0). A lone step of
-    16 sometimes shows on another segment, from outside the query (the same query run again reads nothing there):
-    the measure is then repeated. A segment the query really reads costs hundreds of logical reads at every run."""
-    for _ in range(3):
+def assert_pruned(conn, table: str, where: str, rows: list[dict], read: set[str], segments: int) -> None:
+    """SELECT count(*) AS n, sum(id) AS s FROM the scan of table WHERE where returns rows and reads only the segments
+    in read. With split 'none', the other segments have no logical read at all. With the default split (extents), the
+    planner's DBA_EXTENTS query also reads a few blocks of every segment header, which V$SEGMENT_STATISTICS (steps of
+    16) may show as one step on another segment; reading a segment's rows costs hundreds."""
+    for options, stray in (("split := 'none'", 0), ("", 16)):
+        sql = f"SELECT count(*) AS n, sum(id)::BIGINT AS s FROM {scan_call(table, options)} WHERE {where}"
         result, reads = reads_during(conn, table, sql)
-        assert result == rows
+        assert result == rows, sql
         assert len(reads) == segments, reads
-        assert all(reads[name] > 0 for name in read), reads
-        others = {name: n for name, n in reads.items() if name not in read and n != 0}
-        assert all(n <= 16 for n in others.values()), reads
-        if not others:
-            return
-    raise AssertionError(f"segments other than {sorted(read)} read at every run: {reads}")
+        assert all(reads[name] > 0 for name in read), (sql, reads)
+        assert {name: n for name, n in reads.items() if name not in read and n > stray} == {}, (sql, reads)
 
 
 @pytest.fixture(scope="module")
@@ -302,18 +300,16 @@ def stats_conn():
 
 
 def test_partition_pruning(oracle, partitioned, duck_copy, make_table, stats_conn):
-    call = scan_call(partitioned.name)
-    # Expected counts from the DuckDB copy: an Oracle query here would add logical reads of its own
+    # Expected results from the DuckDB copy: an Oracle query here would add logical reads of its own
     (expected,), (expected_partition,) = results(
-        "SELECT count(*) AS n FROM dcopy WHERE part_date = DATE '2024-05-07' AND sub_key = 'A';\n"
-        "SELECT count(*) AS n FROM dcopy WHERE part_date = DATE '2024-05-07';\n", duck_copy)
+        "SELECT count(*) AS n, sum(id)::BIGINT AS s FROM dcopy WHERE part_date = DATE '2024-05-07' AND sub_key = 'A';\n"
+        "SELECT count(*) AS n, sum(id)::BIGINT AS s FROM dcopy WHERE part_date = DATE '2024-05-07';\n", duck_copy)
     assert expected["n"] > 0
 
-    assert_pruned(stats_conn, partitioned.name,
-                  f"SELECT count(*) AS n FROM {call} WHERE part_date = DATE '2024-05-07' AND sub_key = 'A'",
-                  [expected], {"P0507_SA"}, 12)
-    assert_pruned(stats_conn, partitioned.name, f"SELECT count(*) AS n FROM {call} WHERE part_date = DATE '2024-05-07'",
-                  [expected_partition], {"P0507_SA", "P0507_SB", "P0507_SO"}, 12)
+    assert_pruned(stats_conn, partitioned.name, "part_date = DATE '2024-05-07' AND sub_key = 'A'", [expected],
+                  {"P0507_SA"}, 12)
+    assert_pruned(stats_conn, partitioned.name, "part_date = DATE '2024-05-07'", [expected_partition],
+                  {"P0507_SA", "P0507_SB", "P0507_SO"}, 12)
 
     # LIST partitions on a VARCHAR2 key, no subpartitions
     region = make_table()
@@ -326,9 +322,29 @@ def test_partition_pruning(oracle, partitioned, duck_copy, make_table, stats_con
         "RPAD('x', 100, 'x') FROM dual CONNECT BY LEVEL <= 20000")
     oracle.commit()
     wait_for_snapshot(region, 20000)
-    assert_pruned(stats_conn, region.name,
-                  f"SELECT count(*) AS n, sum(id)::BIGINT AS s FROM {scan_call(region.name)} WHERE region = 'EU'",
-                  [{"n": 4000, "s": sum(range(5, 20001, 5))}], {"P_EU"}, 4)
+    assert_pruned(stats_conn, region.name, "region = 'EU'", [{"n": 4000, "s": sum(range(5, 20001, 5))}], {"P_EU"}, 4)
+
+
+def test_partition_pruning_number_key(oracle, make_table, stats_conn):
+    """LIST partitions on a NUMBER(8) key (days written as integers): equality, IN and ranges prune."""
+    t = make_table()
+    t.create("ID NUMBER(10) NOT NULL, DAY_KEY NUMBER(8), PAD VARCHAR2(100)) PCTFREE 90 PARTITION BY LIST (DAY_KEY) "
+             "(PARTITION P0506 VALUES (20240506), PARTITION P0507 VALUES (20240507), "
+             "PARTITION P0508 VALUES (20240508), PARTITION POTHER VALUES (DEFAULT)")
+    t.execute(f"INSERT /*+ APPEND */ INTO {t.name} (ID, DAY_KEY, PAD) SELECT LEVEL, 20240506 + MOD(LEVEL, 4), "
+              "RPAD('x', 100, 'x') FROM dual CONNECT BY LEVEL <= 20000")
+    oracle.commit()
+    wait_for_snapshot(t, 20000)
+
+    def expected(*offsets: int) -> list[dict]:
+        ids = [i for i in range(1, 20001) if i % 4 in offsets]
+        return [{"n": len(ids), "s": sum(ids)}]
+
+    assert_pruned(stats_conn, t.name, "day_key = 20240507", expected(1), {"P0507"}, 4)
+    assert_pruned(stats_conn, t.name, "day_key IN (20240506, 20240508)", expected(0, 2), {"P0506", "P0508"}, 4)
+    # A range also reads the DEFAULT partition, which may hold values inside it
+    assert_pruned(stats_conn, t.name, "day_key BETWEEN 20240507 AND 20240508", expected(1, 2),
+                  {"P0507", "P0508", "POTHER"}, 4)
 
 
 def test_view_approach(partitioned):
@@ -406,3 +422,46 @@ def test_cast_to_date_equality(partitioned, duck_copy):
         f"SELECT list(id ORDER BY id) AS ids FROM dcopy WHERE {predicate};\n", duck_copy)
     assert through_scan == in_duckdb
     assert len(in_duckdb[0]["ids"]) > 0
+
+
+# Plans that DuckDB's optimizers copy or merge after the filters were pushed: each scan must keep its own Oracle WHERE
+# ({t}: the scan or the DuckDB copy)
+PLAN_SHAPES = [
+    # common subplans: two scans that differ only by their pushed filters
+    ("common_subplan", "SELECT (SELECT max(ts) FROM {t} WHERE sub_key = 'A') IS NULL AS a, "
+                       "(SELECT max(ts) FROM {t} WHERE sub_key = 'NO_SUCH') IS NULL AS b"),
+    ("common_subplan_values", "SELECT (SELECT max(id) FROM {t} WHERE n9 = 7) AS a, "
+                              "(SELECT max(id) FROM {t} WHERE n9 = 8) AS b"),
+    # window self-join: copies the scan below the window
+    ("window", "SELECT id, sub_key, count(*) OVER (PARTITION BY sub_key) AS n FROM {t} "
+               "WHERE part_date = DATE '2024-05-07' ORDER BY id"),
+    ("window_in", "SELECT id, flag, count(*) OVER (PARTITION BY flag) AS n FROM {t} WHERE n9 IN (1, 2, 3) ORDER BY id"),
+    # CTE inlining: copies the definition for each reference
+    ("cte_not_materialized", "WITH c AS NOT MATERIALIZED (FROM {t}) SELECT (SELECT count(*) FROM c WHERE n9 = 7) AS x, "
+                             "(SELECT max(id) FROM c WHERE sub_key = 'B') AS y"),
+    ("cte_limit", "WITH c AS (FROM {t}) SELECT list(id ORDER BY id) AS ids FROM ("
+                  "(SELECT id FROM c WHERE n9 = 7 ORDER BY id LIMIT 3) UNION ALL "
+                  "(SELECT id FROM c WHERE n9 = 8 ORDER BY id LIMIT 3))"),
+    ("limit", "SELECT id FROM {t} WHERE sub_key = 'A' AND n9 > 0 ORDER BY id LIMIT 7"),
+    ("limit_no_order", "SELECT count(*) AS n, bool_and(sub_key = 'A' AND n9 > 0) AS ok FROM "
+                       "(SELECT * FROM {t} WHERE sub_key = 'A' AND n9 > 0 LIMIT 50)"),
+]
+
+
+@pytest.mark.parametrize("query", [q for _, q in PLAN_SHAPES], ids=[name for name, _ in PLAN_SHAPES])
+def test_plan_rewrites_keep_pushed_filters(partitioned, duck_copy, query):
+    through_scan, in_duckdb = results(
+        query.format(t=scan_call(partitioned.name)) + ";\n" + query.format(t="dcopy") + ";\n", duck_copy)
+    assert through_scan == in_duckdb
+
+
+def test_copy_to_file(partitioned, duck_copy):
+    target = WORKDIR / f"filters_{uuid.uuid4().hex[:8]}.csv"
+    try:
+        through_scan, in_duckdb = results(
+            f"COPY (SELECT id FROM {scan_call(partitioned.name)} WHERE sub_key = 'A' AND n9 > 0) TO '{target}';\n"
+            f"SELECT list(id ORDER BY id) AS ids FROM read_csv('{target}');\n"
+            "SELECT list(id ORDER BY id) AS ids FROM dcopy WHERE sub_key = 'A' AND n9 > 0;\n", duck_copy)[-2:]
+        assert through_scan == in_duckdb
+    finally:
+        target.unlink(missing_ok=True)
