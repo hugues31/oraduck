@@ -1,6 +1,9 @@
 """Read-only ATTACH of an Oracle database (spec 4.7): names, listing, pushdown, options, refresh, read-only."""
 
+import re
+import socket
 import subprocess
+import threading
 import time
 import uuid
 
@@ -83,12 +86,15 @@ def attached(table: str) -> str:
     return f"ora.{owner()}.{table}"
 
 
-def run_in_steps(steps: list[tuple[str, object]], timeout: float = 300) -> list[list[dict]]:
+def run_in_steps(steps: list[tuple[str, object]], timeout: float = 300,
+                 bail: bool = True) -> tuple[list[list[dict]], str]:
     """Runs a script in one CLI process, in -json mode, step by step: after the CLI has run a step's SQL, the step's
-    action (a function, or None) runs before the next step is sent. Returns every result of the script."""
+    action (a function, or None) runs before the next step is sent. Returns every result of the script and its error
+    output. With bail, the script must succeed; without, a failed statement does not stop it."""
     WORKDIR.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.Popen([str(DUCKDB), "-batch", "-bail", "-no-agent", "-json", ":memory:"], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=WORKDIR)
+    proc = subprocess.Popen([str(DUCKDB), "-batch"] + (["-bail"] if bail else []) + ["-no-agent", "-json", ":memory:"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            cwd=WORKDIR)
     try:
         for sql, action in steps:
             marker = WORKDIR / f"step_{uuid.uuid4().hex}"
@@ -106,9 +112,61 @@ def run_in_steps(steps: list[tuple[str, object]], timeout: float = 300) -> list[
     finally:
         if proc.poll() is None:
             proc.kill()
-    assert proc.returncode == 0, f"script failed\nSTDOUT:\n{out}\nSTDERR:\n{err}"
+    assert not bail or proc.returncode == 0, f"script failed\nSTDOUT:\n{out}\nSTDERR:\n{err}"
     documents = [d for d in json_documents(split_warnings(out)[0]) if isinstance(d, list)]
-    return [d for d in documents if d != [{"Success": True}]]
+    return [d for d in documents if d != [{"Success": True}]], err
+
+
+class CountingProxy:
+    """TCP forwarder to the Oracle listener that counts the connections it accepts: each Oracle session opens one."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self.target = (host, port)
+        self.server = socket.create_server(("127.0.0.1", 0))
+        self.port = self.server.getsockname()[1]
+        self.connections = 0
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                client, _ = self.server.accept()
+            except OSError:
+                return
+            self.connections += 1
+            upstream = socket.create_connection(self.target)
+            for source, target in ((client, upstream), (upstream, client)):
+                threading.Thread(target=self._pipe, args=(source, target), daemon=True).start()
+
+    @staticmethod
+    def _pipe(source: socket.socket, target: socket.socket) -> None:
+        try:
+            while data := source.recv(65536):
+                target.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for s in (source, target):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        self.server.close()
+
+
+@pytest.fixture
+def proxy():
+    """A counting proxy to the test database, and secret_sql() for a secret px that connects through it."""
+    match = re.fullmatch(r"([^:/]+):(\d+)/(.+)", env("ORADUCK_ORACLE_DSN"))
+    if not match:
+        pytest.skip("ORADUCK_ORACLE_DSN is not an EZConnect host:port/service")
+    p = CountingProxy(match.group(1), int(match.group(2)))
+    p.secret_sql = (f"CREATE SECRET px (TYPE oraduck, USER '{env('ORADUCK_ORACLE_USER')}', "
+                    f"PASSWORD '{env('ORADUCK_ORACLE_PASSWORD')}', DSN '127.0.0.1:{p.port}/{match.group(3)}');\n")
+    yield p
+    p.close()
 
 
 @pytest.fixture(scope="module")
@@ -324,7 +382,7 @@ def test_refresh_by_detach(table):
     def add_column():
         table.execute(f"ALTER TABLE {table.name} ADD (EXTRA NUMBER(5) DEFAULT 7)")
 
-    before, cached, refreshed = run_in_steps([
+    (before, cached, refreshed), _ = run_in_steps([
         (secret_sql() + attach_sql() + query, add_column),
         (query + "DETACH ora;\n" + attach_sql() + query, None),
     ])
@@ -381,3 +439,58 @@ def test_no_session_left_open(oracle, table):
     assert "Error" not in output, output
     assert most >= 1
     assert left == 0
+
+
+def test_listings_open_no_session(proxy, table):
+    """DuckDB lists the schemas and tables of every database for SHOW TABLES, information_schema and the suggestions
+    of a missing-entry error: after ATTACH, these open no Oracle session (the schema named by no query is not
+    described)."""
+    table.create("ID NUMBER(5)")
+    counts = []
+    documents, err = run_in_steps([
+        (proxy.secret_sql + attach_sql(secret="px"), lambda: counts.append(proxy.connections)),
+        ("SHOW TABLES;\nSELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ora';\n"
+         "SELECT count(*) AS n FROM information_schema.tables WHERE table_catalog = 'ora';\n"
+         "CREATE TABLE m (i INTEGER);\nSELECT * FROM mm;\n", lambda: counts.append(proxy.connections)),
+        (f"SELECT count(*) AS n FROM {attached(table.name)};\n", lambda: counts.append(proxy.connections)),
+    ], bail=False)
+    assert counts[0] == 1, counts  # the ATTACH session
+    assert counts[1] == counts[0], counts
+    assert counts[2] > counts[1], counts  # the proxy is on the way to Oracle
+    assert [{"schema_name": owner()}] in documents, documents
+    assert [{"n": 0}] in documents, documents
+    assert "Table with name mm does not exist" in err, err
+
+
+def test_show_all_tables_lists_named_schemas(table):
+    reader = env("ORADUCK_ORACLE_READER_USER").upper()
+    table.create("ID NUMBER(5)")
+    schemas, tables = results(
+        f"SELECT count(*) AS n FROM {attached(table.name)};\n"
+        f"SHOW TABLES FROM ora.{reader};\n"
+        "SELECT list(schema_name ORDER BY schema_name) AS s FROM duckdb_schemas() WHERE database_name = 'ora';\n"
+        "SELECT list(DISTINCT schema) AS s, list(name) AS t FROM (SHOW ALL TABLES) WHERE database = 'ora';\n")[-2:]
+    assert schemas == [{"s": sorted([owner(), reader])}]
+    # READER owns no table; SYS and the other users are never listed
+    assert tables[0]["s"] == [owner()]
+    assert table.name in tables[0]["t"]
+
+
+def test_missing_name_looked_up_once(proxy):
+    """A name found missing stays missing until DETACH: DuckDB looks a name up twice before reporting it missing."""
+    counts = []
+    _, err = run_in_steps([
+        (proxy.secret_sql + attach_sql(secret="px"), lambda: counts.append(proxy.connections)),
+        (f"SELECT * FROM ora.{owner()}.nope;\nSELECT * FROM ora.{owner()}.nope;\nSELECT * FROM ora.NOPE;\n",
+         lambda: counts.append(proxy.connections)),
+    ], bail=False)
+    assert err.count("does not exist") == 3, err
+    assert counts[1] - counts[0] == 1, counts
+
+
+def test_public_synonym_in_default_schema():
+    """In the default schema a name falls back to the public synonyms, as Oracle resolves an unqualified name; another
+    schema does not."""
+    assert scan_json("SELECT count(*) AS n FROM ora.DUAL", setup=attach_sql()) == [{"n": 1}]
+    err = scan_error(f"SELECT * FROM ora.{env('ORADUCK_ORACLE_READER_USER').upper()}.DUAL;\n", setup=attach_sql())
+    assert "Table with name DUAL does not exist" in err, err

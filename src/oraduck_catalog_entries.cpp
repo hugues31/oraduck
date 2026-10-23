@@ -39,29 +39,39 @@ optional_ptr<CatalogEntry> OraduckSchemaEntry::LookupEntry(CatalogTransaction tr
 	if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
 		return nullptr;
 	}
-	// Exact name first, then the upper-cased name (Oracle's unquoted names); a table, view or synonym of the user
+	// Exact name first, then the upper-cased name (Oracle's unquoted names): a table, view or synonym of the user, and
+	// in the default schema a public synonym, as Oracle resolves an unqualified name (the owner left to DescribeSource)
 	const auto &requested = lookup_info.GetEntryName();
 	vector<string> candidates {requested};
 	if (StringUtil::Upper(requested) != requested) {
 		candidates.push_back(StringUtil::Upper(requested));
 	}
+	auto &oraduck_catalog = GetOraduckCatalog();
 	const auto owner = name.GetIdentifierName();
+	const auto target_owner = owner == oraduck_catalog.GetCurrentSchema() ? string() : owner;
 	std::unique_ptr<oraduck::OciSession> session;
 	for (auto &candidate : candidates) {
 		{
+			// A name found missing stays missing until DETACH, as a description stays (DuckDB looks a name up twice
+			// before reporting it missing, and in every database of the search path)
 			lock_guard<mutex> guard(lock);
 			auto entry = tables.find(candidate);
 			if (entry != tables.end()) {
 				return entry->second.get();
 			}
+			if (missing.count(candidate)) {
+				continue;
+			}
 		}
 		oraduck::OracleTableDescription description;
 		try {
 			if (!session) {
-				session = GetOraduckCatalog().OpenSession();
+				session = oraduck_catalog.OpenSession();
 			}
-			description = oraduck::DescribeSource(*session, oraduck::TargetName {owner, candidate});
+			description = oraduck::DescribeSource(*session, oraduck::TargetName {target_owner, candidate});
 		} catch (const oraduck::SourceNotFoundError &) {
+			lock_guard<mutex> guard(lock);
+			missing.insert(candidate);
 			continue;
 		} catch (const oraduck::OraduckError &e) {
 			throw BinderException("OraDuck: " + string(e.what()));
@@ -114,7 +124,9 @@ void OraduckSchemaEntry::Scan(ClientContext &context, CatalogType type,
 	if (type != CatalogType::TABLE_ENTRY) {
 		return;
 	}
-	LoadTables();
+	if (named) {
+		LoadTables();
+	}
 	for (auto &entry : ListedTables()) {
 		callback(entry.get());
 	}

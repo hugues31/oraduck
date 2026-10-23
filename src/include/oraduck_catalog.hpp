@@ -30,8 +30,8 @@ void RegisterOraduckStorage(ExtensionLoader &loader);
 [[noreturn]] void ThrowOraduckReadOnly();
 
 // An Oracle database attached read-only. Schemas are Oracle users, tables are Oracle tables, views and synonyms, read
-// by oraduck_scan's engine with the ATTACH options as scan options. Descriptions are cached until DETACH; the catalog
-// keeps no Oracle session open (each lookup, listing and scan opens its own).
+// by oraduck_scan's engine with the ATTACH options as scan options. Descriptions, and names found missing, are cached
+// until DETACH; the catalog keeps no Oracle session open (each lookup, listing and scan opens its own).
 class OraduckCatalog : public Catalog {
 public:
 	OraduckCatalog(AttachedDatabase &db, oraduck::OracleCredentials credentials, OraduckScanOptions options,
@@ -44,7 +44,11 @@ public:
 	const OraduckScanOptions &GetScanOptions() const {
 		return options;
 	}
-	// A new session prepared for reading; throws OraduckError
+	// The session's current schema at ATTACH: the default schema
+	const string &GetCurrentSchema() const {
+		return current_schema;
+	}
+	// A new session for dictionary queries (not prepared for reading: scans open their own); throws OraduckError
 	std::unique_ptr<oraduck::OciSession> OpenSession() const;
 
 public:
@@ -94,15 +98,15 @@ private:
 private:
 	oraduck::OracleCredentials credentials;
 	OraduckScanOptions options;
-	string current_schema; // the session's current schema at ATTACH, the default schema
-	mutex lock;            // guards users_loaded, users and schemas
+	string current_schema;
+	mutex lock; // guards users_loaded, users and schemas
 	bool users_loaded = false;
 	std::set<string> users;
 	std::map<string, unique_ptr<OraduckSchemaEntry>> schemas; // by Oracle user; entries live until DETACH
 };
 
 // An Oracle user. One lookup describes one object (DescribeSource), a listing describes every table and view of the
-// user at once (DescribeSchema); entries are cached and never replaced.
+// user at once (DescribeSchema), once a query has named the user; entries are cached and never replaced.
 class OraduckSchemaEntry : public SchemaCatalogEntry {
 public:
 	OraduckSchemaEntry(Catalog &catalog, CreateSchemaInfo &info);
@@ -113,6 +117,13 @@ public:
 	void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
 	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override;
 	SimilarCatalogEntry GetSimilarEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override;
+
+	// A query named the schema (LookupSchema): its listings describe its tables. DuckDB lists the tables of every
+	// schema of every database (SHOW TABLES on any database, information_schema, error suggestions); an unnamed
+	// schema lists only the entries already described, without Oracle round trip.
+	void MarkNamed() {
+		named = true;
+	}
 
 	optional_ptr<CatalogEntry> CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
 	                                       TableCatalogEntry &table) override;
@@ -143,9 +154,11 @@ private:
 	OraduckTableEntry &AddTable(const string &name, oraduck::OracleTableDescription description);
 
 private:
-	mutex lock; // guards tables_loaded and tables
+	atomic<bool> named {false};
+	mutex lock; // guards tables_loaded, tables and missing
 	bool tables_loaded = false;
 	std::map<string, unique_ptr<OraduckTableEntry>> tables; // by exact Oracle name; entries live until DETACH
+	std::set<string> missing;                               // exact names Oracle reported missing
 };
 
 // An Oracle table, view or synonym, read by oraduck_scan's function with bind data built from its description.

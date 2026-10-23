@@ -34,9 +34,7 @@ OraduckCatalog::~OraduckCatalog() {
 }
 
 std::unique_ptr<oraduck::OciSession> OraduckCatalog::OpenSession() const {
-	auto session = std::make_unique<oraduck::OciSession>(credentials);
-	oraduck::PrepareReadSession(*session);
-	return session;
+	return std::make_unique<oraduck::OciSession>(credentials);
 }
 
 void OraduckCatalog::Initialize(bool load_builtin) {
@@ -111,17 +109,21 @@ optional_ptr<SchemaCatalogEntry> OraduckCatalog::LookupSchema(CatalogTransaction
 			                        return nullptr;
 		                        }
 		                        lock_guard<mutex> guard(lock);
-		                        return &GetSchemaEntry(user);
+		                        auto &entry = GetSchemaEntry(user);
+		                        entry.MarkNamed();
+		                        return &entry;
 	                        });
 }
 
 void OraduckCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
-	LoadUsers();
+	// The default schema and the schemas already named, without Oracle round trip: DuckDB lists the schemas of every
+	// database for SHOW TABLES, information_schema and the suggestions of any missing-entry error
 	vector<reference<SchemaCatalogEntry>> entries;
 	{
 		lock_guard<mutex> guard(lock);
-		for (auto &user : users) {
-			entries.push_back(GetSchemaEntry(user));
+		GetSchemaEntry(current_schema);
+		for (auto &entry : schemas) {
+			entries.push_back(*entry.second);
 		}
 	}
 	for (auto &entry : entries) {
