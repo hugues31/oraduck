@@ -30,6 +30,7 @@ set(EXTENSION_SOURCES
     src/describe_target.cpp
     src/describe_source.cpp
     src/direct_path_loader.cpp
+    src/fetch_cursor.cpp
     src/oraduck_copy.cpp
     src/column_plan.cpp
     src/chunk_writer.cpp)
