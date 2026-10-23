@@ -105,8 +105,8 @@ private:
 	std::map<string, unique_ptr<OraduckSchemaEntry>> schemas; // by Oracle user; entries live until DETACH
 };
 
-// An Oracle user. One lookup describes one object (DescribeSource), a listing describes every table and view of the
-// user at once (DescribeSchema), once a query has named the user; entries are cached and never replaced.
+// An Oracle user. One lookup describes one object (DescribeSource), the first listing describes every table and view
+// of the user at once (DescribeSchema); entries are cached and never replaced.
 class OraduckSchemaEntry : public SchemaCatalogEntry {
 public:
 	OraduckSchemaEntry(Catalog &catalog, CreateSchemaInfo &info);
@@ -117,13 +117,6 @@ public:
 	void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
 	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override;
 	SimilarCatalogEntry GetSimilarEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override;
-
-	// A query named the schema (LookupSchema): its listings describe its tables. DuckDB lists the tables of every
-	// schema of every database (SHOW TABLES on any database, information_schema, error suggestions); an unnamed
-	// schema lists only the entries already described, without Oracle round trip.
-	void MarkNamed() {
-		named = true;
-	}
 
 	optional_ptr<CatalogEntry> CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
 	                                       TableCatalogEntry &table) override;
@@ -146,7 +139,7 @@ public:
 
 private:
 	OraduckCatalog &GetOraduckCatalog();
-	// Describes every table and view of the user once
+	// Describes every table and view of the user once; throws OraduckError
 	void LoadTables();
 	// The tables and views of the user among the cached entries (not the synonyms)
 	vector<reference<CatalogEntry>> ListedTables();
@@ -154,7 +147,6 @@ private:
 	OraduckTableEntry &AddTable(const string &name, oraduck::OracleTableDescription description);
 
 private:
-	atomic<bool> named {false};
 	mutex lock; // guards tables_loaded, tables and missing
 	bool tables_loaded = false;
 	std::map<string, unique_ptr<OraduckTableEntry>> tables; // by exact Oracle name; entries live until DETACH

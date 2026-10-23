@@ -87,10 +87,11 @@ def attached(table: str) -> str:
 
 
 def run_in_steps(steps: list[tuple[str, object]], timeout: float = 300,
-                 bail: bool = True) -> tuple[list[list[dict]], str]:
+                 bail: bool = True) -> tuple[list[list[dict]], str, list[str]]:
     """Runs a script in one CLI process, in -json mode, step by step: after the CLI has run a step's SQL, the step's
-    action (a function, or None) runs before the next step is sent. Returns every result of the script and its error
-    output. With bail, the script must succeed; without, a failed statement does not stop it."""
+    action (a function, or None) runs before the next step is sent. Returns every result of the script, its error
+    output and the warnings it printed. With bail, the script must succeed; without, a failed statement does not stop
+    it."""
     WORKDIR.mkdir(parents=True, exist_ok=True)
     proc = subprocess.Popen([str(DUCKDB), "-batch"] + (["-bail"] if bail else []) + ["-no-agent", "-json", ":memory:"],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -113,8 +114,9 @@ def run_in_steps(steps: list[tuple[str, object]], timeout: float = 300,
         if proc.poll() is None:
             proc.kill()
     assert not bail or proc.returncode == 0, f"script failed\nSTDOUT:\n{out}\nSTDERR:\n{err}"
-    documents = [d for d in json_documents(split_warnings(out)[0]) if isinstance(d, list)]
-    return [d for d in documents if d != [{"Success": True}]], err
+    stdout, warnings = split_warnings(out)
+    documents = [d for d in json_documents(stdout) if isinstance(d, list)]
+    return [d for d in documents if d != [{"Success": True}]], err, warnings
 
 
 class CountingProxy:
@@ -153,6 +155,12 @@ class CountingProxy:
                     pass
 
     def close(self) -> None:
+        """Refuses every new connection (Oracle unreachable). shutdown wakes the thread blocked in accept, which a
+        close alone does not."""
+        try:
+            self.server.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self.server.close()
 
 
@@ -266,7 +274,7 @@ def test_show_tables_and_columns(oracle, table):
         cur.execute(f"CREATE VIEW {view} AS SELECT N4, V FROM {table.name}")
     try:
         tables, columns, view_columns = results(
-            f"SHOW TABLES FROM ora.{owner()};\n"
+            "SHOW TABLES FROM ora;\n"
             "SELECT column_name, data_type FROM information_schema.columns "
             f"WHERE table_catalog = 'ora' AND table_schema = '{owner()}' AND table_name = '{table.name}' "
             "ORDER BY ordinal_position;\n"
@@ -382,7 +390,7 @@ def test_refresh_by_detach(table):
     def add_column():
         table.execute(f"ALTER TABLE {table.name} ADD (EXTRA NUMBER(5) DEFAULT 7)")
 
-    (before, cached, refreshed), _ = run_in_steps([
+    (before, cached, refreshed), _, _ = run_in_steps([
         (secret_sql() + attach_sql() + query, add_column),
         (query + "DETACH ora;\n" + attach_sql() + query, None),
     ])
@@ -441,25 +449,53 @@ def test_no_session_left_open(oracle, table):
     assert left == 0
 
 
-def test_listings_open_no_session(proxy, table):
-    """DuckDB lists the schemas and tables of every database for SHOW TABLES, information_schema and the suggestions
-    of a missing-entry error: after ATTACH, these open no Oracle session (the schema named by no query is not
-    described)."""
+def test_listings_describe_the_default_schema_once(proxy, table):
+    """DuckDB lists the tables of every database for SHOW TABLES and information_schema: the first listing describes
+    the default schema (one session), the next ones and the suggestions of a missing-entry error use the cache, even
+    with Oracle unreachable."""
     table.create("ID NUMBER(5)")
     counts = []
-    documents, err = run_in_steps([
+
+    def unreachable():
+        counts.append(proxy.connections)
+        proxy.close()
+
+    documents, err, warnings = run_in_steps([
         (proxy.secret_sql + attach_sql(secret="px"), lambda: counts.append(proxy.connections)),
-        ("SHOW TABLES;\nSELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ora';\n"
-         "SELECT count(*) AS n FROM information_schema.tables WHERE table_catalog = 'ora';\n"
-         "CREATE TABLE m (i INTEGER);\nSELECT * FROM mm;\n", lambda: counts.append(proxy.connections)),
-        (f"SELECT count(*) AS n FROM {attached(table.name)};\n", lambda: counts.append(proxy.connections)),
+        ("SHOW TABLES;\n", lambda: counts.append(proxy.connections)),
+        ("SHOW TABLES;\nSHOW TABLES FROM ora;\n"
+         "SELECT list(table_name) AS t FROM information_schema.tables WHERE table_catalog = 'ora';\n"
+         "SELECT list(schema_name) AS s FROM duckdb_schemas() WHERE database_name = 'ora';\n"
+         "CREATE TABLE m (i INTEGER);\nSELECT * FROM mm;\n", unreachable),
+        ("SHOW TABLES;\nSHOW TABLES FROM ora;\nSELECT * FROM mm;\n", None),
     ], bail=False)
     assert counts[0] == 1, counts  # the ATTACH session
-    assert counts[1] == counts[0], counts
-    assert counts[2] > counts[1], counts  # the proxy is on the way to Oracle
-    assert [{"schema_name": owner()}] in documents, documents
-    assert [{"n": 0}] in documents, documents
-    assert "Table with name mm does not exist" in err, err
+    assert counts[1] - counts[0] <= 1, counts  # the default schema, described once
+    assert counts[2] == counts[1], counts
+    from_ora = [d for d in documents if d and "name" in d[0] and table.name in {row["name"] for row in d}]
+    assert len(from_ora) == 2, documents  # before and after Oracle became unreachable
+    assert table.name in next(d for d in documents if d and "t" in d[0])[0]["t"]
+    assert [{"s": [owner()]}] in documents, documents
+    assert [{"name": "m"}] in documents, documents
+    assert err.count("Table with name mm does not exist") == 2, err
+    assert "OraDuck" not in err + "".join(warnings), (err, warnings)
+
+
+def test_listing_with_oracle_unreachable(proxy, table):
+    """Oracle unreachable at the first listing: the listing logs a warning and the schema lists nothing, local commands
+    work as usual, and the lookup of an Oracle table raises its error."""
+    table.create("ID NUMBER(5)")
+    documents, err, warnings = run_in_steps([
+        (proxy.secret_sql + attach_sql(secret="px"), proxy.close),
+        ("CREATE TABLE m (i INTEGER);\nSHOW TABLES;\nSHOW TABLES FROM ora;\nSELECT * FROM mm;\n"
+         f"SELECT * FROM {attached(table.name)};\n", None),
+    ], bail=False)
+    assert documents == [[{"name": "m"}], []], documents
+    assert any(f"OraDuck: cannot list the tables of ora.{owner()}: " in w for w in warnings), warnings
+    errors = [line for line in err.splitlines() if "Error" in line]
+    assert len(errors) == 2, err
+    assert "Table with name mm does not exist" in errors[0] and "OraDuck" not in errors[0], err
+    assert "OraDuck: " in errors[1] and "ORA-" in errors[1], err
 
 
 def test_show_all_tables_lists_named_schemas(table):
@@ -479,7 +515,7 @@ def test_show_all_tables_lists_named_schemas(table):
 def test_missing_name_looked_up_once(proxy):
     """A name found missing stays missing until DETACH: DuckDB looks a name up twice before reporting it missing."""
     counts = []
-    _, err = run_in_steps([
+    _, err, _ = run_in_steps([
         (proxy.secret_sql + attach_sql(secret="px"), lambda: counts.append(proxy.connections)),
         (f"SELECT * FROM ora.{owner()}.nope;\nSELECT * FROM ora.{owner()}.nope;\nSELECT * FROM ora.NOPE;\n",
          lambda: counts.append(proxy.connections)),

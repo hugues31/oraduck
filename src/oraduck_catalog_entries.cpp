@@ -2,6 +2,7 @@
 
 #include "duckdb/catalog/similar_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
@@ -90,11 +91,9 @@ void OraduckSchemaEntry::LoadTables() {
 		}
 	}
 	std::vector<oraduck::OracleTableDescription> descriptions;
-	try {
+	{
 		auto session = GetOraduckCatalog().OpenSession();
 		descriptions = oraduck::DescribeSchema(*session, name.GetIdentifierName());
-	} catch (const oraduck::OraduckError &e) {
-		throw IOException("OraDuck: " + string(e.what()));
 	}
 	lock_guard<mutex> guard(lock);
 	if (tables_loaded) {
@@ -124,8 +123,14 @@ void OraduckSchemaEntry::Scan(ClientContext &context, CatalogType type,
 	if (type != CatalogType::TABLE_ENTRY) {
 		return;
 	}
-	if (named) {
+	try {
 		LoadTables();
+	} catch (const oraduck::OraduckError &e) {
+		// DuckDB lists the tables of every database (SHOW TABLES on any database, information_schema): Oracle being
+		// unreachable must not fail them. The schema lists nothing; the next listing tries again.
+		DUCKDB_LOG_WARNING(context, "OraDuck: cannot list the tables of " + catalog.GetName() + "." + name + ": " +
+		                                string(e.what()));
+		return;
 	}
 	for (auto &entry : ListedTables()) {
 		callback(entry.get());

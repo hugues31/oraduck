@@ -109,9 +109,7 @@ optional_ptr<SchemaCatalogEntry> OraduckCatalog::LookupSchema(CatalogTransaction
 			                        return nullptr;
 		                        }
 		                        lock_guard<mutex> guard(lock);
-		                        auto &entry = GetSchemaEntry(user);
-		                        entry.MarkNamed();
-		                        return &entry;
+		                        return &GetSchemaEntry(user);
 	                        });
 }
 
