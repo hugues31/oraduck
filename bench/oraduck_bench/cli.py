@@ -149,8 +149,10 @@ def main(argv: list[str] | None = None) -> int:
             for ncols in COLS:
                 runner.run_competitor_case(cfg, nrows, ncols, out, timeouts)
     elif args.command == "read-smoke":
-        records = read_runner.run_read_case(cfg, 1_000_000, 50, ["oraduck"], 1, out, warmup=False)
-        print(f"{records[0]['method']}: {records[0]['total_s']:.3f} s\nchecksums OK")
+        records = read_runner.run_read_case(cfg, 1_000_000, 50, ["oraduck"], 1, out, warmup=False,
+                                            link_counter=_link_counter())
+        print(f"{records[0]['method']}: {records[0]['total_s']:.3f} s, link_bytes {records[0]['link_bytes']}\n"
+              "checksums OK")
     elif args.command == "read-matrix":
         timeouts: set[tuple[str, int, int]] = set()
         for nrows, ncols in only or READ_CASES:
