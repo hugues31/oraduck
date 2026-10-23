@@ -14,10 +14,11 @@ namespace oraduck {
 
 // Fetch settings; the defaults are the read probe's decisions (docs/probe-results.md, "Read path decisions").
 struct FetchOptions {
-	uint64_t buffer_budget_bytes = 67108864; // define buffers of one batch
+	uint64_t buffer_budget_bytes = 67108864; // one batch: define buffers, LOB locators (12 KiB per row) and values
 	uint32_t prefetch_memory_bytes = 0;      // OCI_ATTR_PREFETCH_MEMORY (0: no OCI prefetch)
 	uint32_t max_rows = 8192;                // rows per fetch at most
 	uint32_t lob_prefetch_chars = 32768;     // LOB prefetch per value: characters (CLOB, NCLOB) or bytes (BLOB)
+	uint32_t lob_read_chunk_for_tests = 0;   // test only: characters (bytes) per OCILobRead2 call, 0 = whole value
 };
 
 // One query on one session: array fetches into define buffers sized by a byte budget, LOBs through
@@ -32,10 +33,12 @@ public:
 	FetchCursor(const FetchCursor &) = delete;
 	FetchCursor &operator=(const FetchCursor &) = delete;
 
-	// Next batch: its row count, 0 at the end. Reads the batch's LOB values.
+	// Next batch: its row count, 0 at the end. Reads the batch's LOB values; when the LOB values of a batch
+	// make it larger than the budget, the next batches ask for fewer rows.
 	uint32_t Fetch();
 
-	// clamp(budget / sum(define_bytes + 8), 1, max_rows)
+	// Size of the define arrays: clamp(budget / row bytes, 1, max_rows), where a row counts define_bytes + 8 per
+	// column and 12 KiB per LOB column (OCI's memory for a locator and its LOB prefetch)
 	uint32_t rows_per_fetch() const {
 		return rows_;
 	}
@@ -82,7 +85,12 @@ private:
 	void Close();
 
 	OciSession &session_;
-	uint32_t rows_ = 1;
+	uint64_t budget_ = 0;
+	uint64_t row_bytes_ = 0; // budgeted bytes per row, without LOB values
+	uint32_t rows_ = 1;      // define array size
+	uint32_t next_rows_ = 1; // rows asked by the next fetch
+	uint32_t lob_read_chunk_ = 0;
+	bool has_lobs_ = false;
 	OCIStmt *stmt_ = nullptr;
 	std::vector<BindValue> binds_; // bound by address: kept until the statement is released
 	std::vector<sb2> bind_ind_;

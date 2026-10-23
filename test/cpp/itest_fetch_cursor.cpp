@@ -303,8 +303,8 @@ struct Piece {
 	std::string tail = "";
 };
 
-// Inserts (id, value) into table (ID, C) and returns the value the server built
-std::string InsertClob(OciSession &session, const std::string &table, int id, const std::vector<Piece> &pieces) {
+// Builds the value in the PL/SQL variable c, runs insert (a statement using c) and returns the value
+std::string BuildClob(OciSession &session, const std::vector<Piece> &pieces, const std::string &insert) {
 	std::string sql =
 	    "DECLARE c CLOB; buf VARCHAR2(32767); "
 	    "PROCEDURE add(s VARCHAR2) IS BEGIN "
@@ -319,11 +319,15 @@ std::string InsertClob(OciSession &session, const std::string &table, int id, co
 			expected += piece.head + (piece.numbered ? std::to_string(k) : "") + piece.tail;
 		}
 	}
-	sql += "IF buf IS NOT NULL THEN DBMS_LOB.APPEND(c, TO_CLOB(buf)); END IF; "
-	       "INSERT INTO " +
-	       table + " (ID, C) VALUES (" + std::to_string(id) + ", c); DBMS_LOB.FREETEMPORARY(c); END;";
+	sql += "IF buf IS NOT NULL THEN DBMS_LOB.APPEND(c, TO_CLOB(buf)); END IF; " + insert +
+	       "; DBMS_LOB.FREETEMPORARY(c); END;";
 	session.Execute(sql);
 	return expected;
+}
+
+// Inserts (id, value) into table (ID, C) and returns the value the server built
+std::string InsertClob(OciSession &session, const std::string &table, int id, const std::vector<Piece> &pieces) {
+	return BuildClob(session, pieces, "INSERT INTO " + table + " (ID, C) VALUES (" + std::to_string(id) + ", c)");
 }
 
 std::string RowGenerator(int64_t rows) {
@@ -492,8 +496,12 @@ TEST_CASE("Fetch cursor: CLOB values read byte for byte", "[oracle][fetch_cursor
 	small.lob_prefetch_chars = 4097;
 	FetchOptions none;
 	none.lob_prefetch_chars = 0;
-	for (const auto &options : {FetchOptions(), small, none}) {
-		INFO("max_rows " << options.max_rows << ", LOB prefetch " << options.lob_prefetch_chars);
+	// several OCILobRead2 calls per value, the call boundaries inside surrogate pairs
+	FetchOptions chunked;
+	chunked.lob_read_chunk_for_tests = 1001;
+	for (const auto &options : {FetchOptions(), small, none, chunked}) {
+		INFO("max_rows " << options.max_rows << ", LOB prefetch " << options.lob_prefetch_chars << ", read chunk "
+		                 << options.lob_read_chunk_for_tests);
 		FetchCursor cursor(session, plan.statement, plan.columns, options);
 		std::map<int64_t, Cell> read;
 		for (uint32_t n; (n = cursor.Fetch()) > 0;) {
@@ -535,10 +543,12 @@ TEST_CASE("Fetch cursor: 2 MB CLOB of 4-byte characters", "[oracle][fetch_cursor
 	REQUIRE(expected[1].size() == 2097152);
 
 	ReadPlan plan(session, "ITEST_FC_EMOJI");
-	for (const uint32_t prefetch : {32768u, 32767u, 0u}) {
-		INFO("LOB prefetch " << prefetch);
-		FetchOptions options;
-		options.lob_prefetch_chars = prefetch;
+	std::vector<FetchOptions> variants(4);
+	variants[1].lob_prefetch_chars = 32767;
+	variants[2].lob_prefetch_chars = 0;
+	variants[3].lob_read_chunk_for_tests = 1001; // several OCILobRead2 calls, boundaries inside surrogate pairs
+	for (const auto &options : variants) {
+		INFO("LOB prefetch " << options.lob_prefetch_chars << ", read chunk " << options.lob_read_chunk_for_tests);
 		FetchCursor cursor(session, plan.statement, plan.columns, options);
 		const Rows rows = ReadAll(cursor, 2);
 		REQUIRE(rows.size() == 2);
@@ -573,8 +583,10 @@ TEST_CASE("Fetch cursor: BLOB values read byte for byte", "[oracle][fetch_cursor
 	ReadPlan plan(session, "ITEST_FC_BLOB");
 	FetchOptions none;
 	none.lob_prefetch_chars = 0;
-	for (const auto &options : {FetchOptions(), none}) {
-		INFO("LOB prefetch " << options.lob_prefetch_chars);
+	FetchOptions chunked;
+	chunked.lob_read_chunk_for_tests = 1001; // bytes per OCILobRead2 call
+	for (const auto &options : {FetchOptions(), none, chunked}) {
+		INFO("LOB prefetch " << options.lob_prefetch_chars << ", read chunk " << options.lob_read_chunk_for_tests);
 		FetchCursor cursor(session, plan.statement, plan.columns, options);
 		const Rows rows = ReadAll(cursor, 2);
 		REQUIRE(rows.size() == 4);
@@ -588,6 +600,56 @@ TEST_CASE("Fetch cursor: BLOB values read byte for byte", "[oracle][fetch_cursor
 			REQUIRE_FALSE(row[1].null);
 			CHECK(row[1].bytes == expected.at(id));
 		}
+	}
+}
+
+TEST_CASE("Fetch cursor: large LOB values bound the batches by the budget", "[oracle][fetch_cursor][lob]") {
+	OciSession session(TestCredentials());
+	DropGuard guard {session, {"ITEST_FC_BIG"}};
+	guard.DropAll();
+	session.Execute("CREATE TABLE ITEST_FC_BIG (ID NUMBER(10), C CLOB)");
+	// 64 rows: a 5-digit ID then the same 1.1 MB of multi-byte text
+	const std::string base = BuildClob(session, {{"a", 70000, true, "é漢😀;"}},
+	                                   "INSERT INTO ITEST_FC_BIG (ID, C) SELECT LEVEL, "
+	                                   "TO_CLOB(TO_CHAR(LEVEL, 'FM00000')) || c FROM dual CONNECT BY LEVEL <= 64");
+	REQUIRE(base.size() > 1000000);
+	auto expected = [&base](int64_t id) {
+		const std::string digits = std::to_string(id);
+		return std::string(5 - digits.size(), '0') + digits + base;
+	};
+
+	ReadPlan plan(session, "ITEST_FC_BIG");
+	FetchOptions options;
+	options.buffer_budget_bytes = 4 * 1024 * 1024;
+	options.max_rows = 16; // the first batch, before any LOB size is known
+	FetchCursor cursor(session, plan.statement, plan.columns, options);
+	REQUIRE(cursor.rows_per_fetch() == 16);
+	std::vector<uint32_t> batches;
+	std::vector<uint64_t> batch_bytes;
+	int64_t rows = 0, wrong = 0;
+	for (uint32_t n; (n = cursor.Fetch()) > 0;) {
+		uint64_t bytes = 0;
+		for (uint32_t r = 0; r < n; r++) {
+			uint32_t length = 0;
+			const int64_t id = Int64(std::string(reinterpret_cast<const char *>(cursor.Value(0, r, length)), 8));
+			const uint8_t *value = cursor.Value(1, r, length);
+			if (!value || std::string(reinterpret_cast<const char *>(value), length) != expected(id)) {
+				wrong++;
+			}
+			bytes += length;
+		}
+		batches.push_back(n);
+		batch_bytes.push_back(bytes);
+		rows += n;
+	}
+	CHECK(rows == 64);
+	CHECK(wrong == 0);
+	REQUIRE(batches.size() > 1);
+	CHECK(batches[0] == 16);
+	for (size_t b = 1; b < batches.size(); b++) {
+		INFO("batch " << b << ": " << batches[b] << " rows, " << batch_bytes[b] << " LOB bytes");
+		CHECK(batches[b] >= 1);
+		CHECK(batch_bytes[b] + batches[b] * (16 + 12288) <= options.buffer_budget_bytes);
 	}
 }
 
@@ -785,6 +847,8 @@ TEST_CASE("Fetch cursor: round trips with 5 small CLOB columns", "[oracle][fetch
 	int64_t rows = 0, characters = 0, null_values = 0;
 	{
 		FetchCursor cursor(session, plan.statement, plan.columns, FetchOptions());
+		// ID (8 + 8 bytes) and 12 KiB per LOB column
+		CHECK(cursor.rows_per_fetch() == 67108864 / (16 + 5 * 12288));
 		for (uint32_t n; (n = cursor.Fetch()) > 0;) {
 			for (uint32_t r = 0; r < n; r++) {
 				for (size_t c = 1; c <= 5; c++) {

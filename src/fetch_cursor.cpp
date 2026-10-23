@@ -11,6 +11,9 @@ namespace {
 
 constexpr size_t kInitialLobBytes = 64 * 1024;
 constexpr size_t kMaxUtf8BytesPerChar = 4; // a CLOB character read as UTF-8 takes at most 4 bytes
+// Budgeted bytes per row of a LOB column: OCI holds about 4 KiB per locator, 11 KiB with a 32,768-character
+// LOB prefetch (measured on small CLOBs); the values themselves are budgeted from the previous batch
+constexpr uint64_t kLobRowBytes = 12 * 1024;
 
 // Define of the constant 1 that BuildScanSql selects when no column is projected
 const ReadColumnPlan &RowCounterPlan() {
@@ -25,14 +28,17 @@ const ReadColumnPlan &RowCounterPlan() {
 	return plan;
 }
 
-uint32_t RowsPerFetch(const std::vector<const ReadColumnPlan *> &columns, const FetchOptions &options) {
+uint64_t RowBytes(const std::vector<const ReadColumnPlan *> &columns) {
 	uint64_t row_bytes = 0;
 	for (const auto *column : columns) {
-		row_bytes += static_cast<uint64_t>(column->define_bytes) + 8;
+		row_bytes += column->lob ? kLobRowBytes : static_cast<uint64_t>(column->define_bytes) + 8;
 	}
-	const uint64_t max_rows = std::max<uint32_t>(options.max_rows, 1);
-	const uint64_t rows = row_bytes == 0 ? max_rows : options.buffer_budget_bytes / row_bytes;
-	return static_cast<uint32_t>(std::min(std::max<uint64_t>(rows, 1), max_rows));
+	return std::max<uint64_t>(row_bytes, 1);
+}
+
+// clamp(budget / row_bytes, 1, max_rows)
+uint32_t RowsWithin(uint64_t budget, uint64_t row_bytes, uint64_t max_rows) {
+	return static_cast<uint32_t>(std::min(std::max<uint64_t>(budget / row_bytes, 1), max_rows));
 }
 
 const OraText *Text(const std::string &value) {
@@ -47,7 +53,11 @@ FetchCursor::FetchCursor(OciSession &session, const SqlStatement &statement,
 	if (columns.empty()) {
 		columns.push_back(&RowCounterPlan());
 	}
-	rows_ = RowsPerFetch(columns, options);
+	budget_ = options.buffer_budget_bytes;
+	row_bytes_ = RowBytes(columns);
+	rows_ = RowsWithin(budget_, row_bytes_, std::max<uint32_t>(options.max_rows, 1));
+	next_rows_ = rows_;
+	lob_read_chunk_ = options.lob_read_chunk_for_tests;
 	try {
 		Open(statement, columns, options);
 	} catch (...) {
@@ -88,6 +98,7 @@ void FetchCursor::Open(const SqlStatement &statement, const std::vector<const Re
 	for (size_t i = 0; i < columns.size(); i++) {
 		Define(static_cast<ub4>(i + 1), *columns[i], options, columns_[i]);
 		if (columns_[i].lob && !lob_data_) {
+			has_lobs_ = true;
 			ReserveLob(kInitialLobBytes); // never a null pointer for an empty LOB
 		}
 	}
@@ -134,11 +145,13 @@ void FetchCursor::Define(ub4 position, const ReadColumnPlan &plan, const FetchOp
 		CheckOci(Oci().OCIAttrSet(column.define, OCI_HTYPE_DEFINE, &form, 0, OCI_ATTR_CHARSET_FORM, err), err,
 		         "OCI_ATTR_CHARSET_FORM");
 	}
-	if (plan.lob && options.lob_prefetch_chars > 0) {
-		ub4 size = options.lob_prefetch_chars;
-		int length = 1;
-		CheckOci(Oci().OCIAttrSet(column.define, OCI_HTYPE_DEFINE, &size, 0, OCI_ATTR_LOBPREFETCH_SIZE, err), err,
-		         "OCI_ATTR_LOBPREFETCH_SIZE");
+	if (plan.lob) {
+		if (options.lob_prefetch_chars > 0) {
+			ub4 size = options.lob_prefetch_chars;
+			CheckOci(Oci().OCIAttrSet(column.define, OCI_HTYPE_DEFINE, &size, 0, OCI_ATTR_LOBPREFETCH_SIZE, err), err,
+			         "OCI_ATTR_LOBPREFETCH_SIZE");
+		}
+		int length = 1; // even without data prefetch: OCILobGetLength2 then costs no round trip
 		CheckOci(Oci().OCIAttrSet(column.define, OCI_HTYPE_DEFINE, &length, 0, OCI_ATTR_LOBPREFETCH_LENGTH, err), err,
 		         "OCI_ATTR_LOBPREFETCH_LENGTH");
 	}
@@ -149,7 +162,7 @@ uint32_t FetchCursor::Fetch() {
 		return 0;
 	}
 	OCIError *err = session_.err();
-	const sword rc = Oci().OCIStmtFetch2(stmt_, err, rows_, OCI_FETCH_NEXT, 0, OCI_DEFAULT);
+	const sword rc = Oci().OCIStmtFetch2(stmt_, err, next_rows_, OCI_FETCH_NEXT, 0, OCI_DEFAULT);
 	if (rc == OCI_NO_DATA) {
 		done_ = true; // the last rows may come with OCI_NO_DATA
 	} else {
@@ -160,6 +173,11 @@ uint32_t FetchCursor::Fetch() {
 	         "OCI_ATTR_ROWS_FETCHED");
 	CheckValues(fetched);
 	ReadLobs(fetched);
+	if (has_lobs_ && fetched > 0) {
+		// the next batch asks for the rows that fit the budget with this batch's LOB bytes per row
+		const uint64_t lob_bytes_per_row = (lob_used_ + fetched - 1) / fetched;
+		next_rows_ = RowsWithin(budget_, row_bytes_ + lob_bytes_per_row, rows_);
+	}
 	return fetched;
 }
 
@@ -181,6 +199,13 @@ void FetchCursor::CheckValues(uint32_t rows) const {
 
 void FetchCursor::ReadLobs(uint32_t rows) {
 	lob_used_ = 0;
+	const size_t keep = static_cast<size_t>(std::max<uint64_t>(2 * budget_, kInitialLobBytes));
+	if (lob_capacity_ > keep) {
+		// release what an oversized batch (large values, or the first batch) needed beyond twice the budget
+		lob_data_.reset();
+		lob_capacity_ = 0;
+		ReserveLob(keep);
+	}
 	for (auto &column : columns_) {
 		if (!column.lob) {
 			continue;
@@ -193,7 +218,9 @@ void FetchCursor::ReadLobs(uint32_t rows) {
 	}
 }
 
-// Reads the whole value into lob_data_ (from the LOB prefetch when it fits, otherwise one more round trip)
+// Reads the whole value into lob_data_ (from the LOB prefetch when it fits, otherwise one more round trip).
+// Temporary LOBs (computed columns, such as TO_CLOB(...) in a view) are deliberately not freed here: each
+// OCILobFreeTemporary costs a round trip; the session releases them when it ends.
 void FetchCursor::ReadLob(Column &column, uint32_t row) {
 	OCISvcCtx *svc = session_.svc();
 	OCIError *err = session_.err();
@@ -213,14 +240,16 @@ void FetchCursor::ReadLob(Column &column, uint32_t row) {
 	while (done < total) {
 		ub8 bytes = characters ? 0 : total - done;
 		ub8 chars = characters ? total - done : 0;
+		if (lob_read_chunk_) {
+			(characters ? chars : bytes) = std::min<ub8>(characters ? chars : bytes, lob_read_chunk_);
+		}
 		CheckOci(Oci().OCILobRead2(svc, err, locator, &bytes, &chars, done + 1, out + used, capacity - used,
 		                           OCI_ONE_PIECE, nullptr, nullptr, 0, form),
 		         err, "OCILobRead2");
 		const ub8 progress = characters ? chars : bytes;
 		if (progress == 0 || bytes > capacity - used) {
-			throw OracleError("OCILobRead2: column \"" + column.name + "\": unexpected read of " +
-			                      std::to_string(bytes) + " bytes at offset " + std::to_string(done + 1),
-			                  0);
+			throw OraduckError("OCILobRead2: column \"" + column.name + "\": unexpected read of " +
+			                   std::to_string(bytes) + " bytes at offset " + std::to_string(done + 1));
 		}
 		done += progress;
 		used += static_cast<size_t>(bytes);
