@@ -24,19 +24,25 @@ def oracle_checksums(cfg: OracleConfig, table: str, where: str) -> read_schema.R
     try:
         with conn.cursor() as cur:
             cur.execute(read_schema.READ_CHECKSUM_ORACLE.format(table=table, where=where))
-            return read_schema.ReadChecksums(*(int(v) for v in cur.fetchone()))
+            return read_schema.ReadChecksums.from_row(cur.fetchone())
     finally:
         conn.close()
 
 
 def duck_checksums() -> read_schema.ReadChecksums:
     row = duck.query(read_schema.READ_CHECKSUM_DUCK.format(table="t"), READ_OUT_DB)[0]
-    return read_schema.ReadChecksums(*(int(v) for v in row))
+    return read_schema.ReadChecksums.from_row(row)
 
 
 def duck_checksums_cast() -> read_schema.ReadChecksums:
     row = duck.query(read_schema.READ_CHECKSUM_DUCK_CAST.format(table="t"), READ_OUT_DB)[0]
-    return read_schema.ReadChecksums(*(int(v) for v in row))
+    return read_schema.ReadChecksums.from_row(row)
+
+
+def duck_d1_decimal() -> bool:
+    """True when the method loaded D1 as a DECIMAL (its sum is then compared exactly)."""
+    rows = duck.query(read_schema.READ_D1_TYPE_DUCK.format(table="t"), READ_OUT_DB)
+    return bool(rows) and rows[0][0].upper().startswith("DECIMAL")
 
 
 def run_read_case(
@@ -55,6 +61,7 @@ def run_read_case(
     run_method: Callable = read_methods.run,
     duck_checksums: Callable = duck_checksums,
     duck_checksums_cast: Callable = duck_checksums_cast,
+    duck_d1_decimal: Callable = duck_d1_decimal,
     oracle_checksums: Callable = oracle_checksums,
     link_counter: Callable[[], int] | None = None,
     shaping: dict | None = None,
@@ -63,7 +70,8 @@ def run_read_case(
 ) -> list[dict]:
     """One warm-up round (unless warmup is false) then `runs` interleaved rounds of `methods`. A method that
     exceeds timeout_s is added to `timeouts` and is no longer run on cases at least as large. Oracle's checksums
-    are computed once (the data does not change); DuckDB's are compared after every run.
+    are computed once (the data does not change); DuckDB's are compared after every run, the sum of D1 exactly when
+    the method loaded D1 as DECIMAL and within a relative 1e-12 otherwise (recorded in `d1_comparison`).
     `link_counter` returns the bytes received on the Oracle link: its difference around a run fills `link_bytes`.
     `shaping` (the parsed qdiscs) and `variant` (for example "compression") are copied to every record; `planning`
     (cfg, table, threads, where) returns the OraDuck planning time in ms, recorded once after the runs."""
@@ -122,8 +130,10 @@ def run_read_case(
                     if method.startswith("oraduck"):
                         raise
                     got, cast = duck_checksums_cast(), True  # the method loaded a column as another type
-                if got != expected:
-                    message = (f"{method} N={threads} {table} run {round_index}: expected {expected}, got {got}")
+                matches, d1_comparison = read_schema.compare_checksums(expected, got, duck_d1_decimal())
+                if not matches:
+                    message = (f"{method} N={threads} {table} run {round_index}: expected {expected}, got {got} "
+                               f"(D1 compared: {d1_comparison})")
                     if method.startswith("oraduck"):
                         raise ChecksumMismatch(message)
                     # a competitor that loads other data is reported as such, not timed
@@ -135,9 +145,11 @@ def run_read_case(
                     continue
                 m = replace(m, nrows=nrows, ncols=ncols)
                 records.append(_append(out, {"type": "measure", "suite": READ_SUITE, "index": round_index,
-                                             "warmup": is_warmup, "at": at, "checksum_cast": cast, **tags, **asdict(m)}))
+                                             "warmup": is_warmup, "at": at, "checksum_cast": cast,
+                                             "d1_comparison": d1_comparison, **tags, **asdict(m)}))
                 print(f"{READ_SUITE} {table} {method} N={threads}{' (warm-up)' if is_warmup else ''}: "
-                      f"{m.total_s:.3f} s{' (checksums on casts)' if cast else ''}", flush=True)
+                      f"{m.total_s:.3f} s{' (checksums on casts)' if cast else ''}"
+                      f"{'' if d1_comparison == 'exact' else f' (D1 compared: {d1_comparison})'}", flush=True)
         if planning is not None and any(r["type"] == "measure" and r["method"].startswith("oraduck")
                                         for r in records):
             ms = planning(cfg, table, threads, where)

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from decimal import Decimal
 from pathlib import Path
 
 from .config import ORACLE_SCHEMA
@@ -108,21 +109,59 @@ class ReadChecksums:
     len_v1: int
     nulls_d1: int
     len_clob1: int
+    sum_d1: str  # exact decimal text of the sum of D1 (NUMBER(25,9))
+    epoch_dt1: int  # sum of the epoch seconds of DT1 (DATE)
+    epoch_us_ts1: int  # sum of the epoch microseconds of TS1 (TIMESTAMP(6))
+    c1_frequent: int  # rows whose C1 (CHAR(1)) is C1_VALUE
 
+    @classmethod
+    def from_row(cls, row) -> "ReadChecksums":
+        """From a result row (numbers or their text): sum_d1 stays text, the others are integers."""
+        values = list(row)
+        return cls(*(int(v) for v in values[:5]), str(values[5]), *(int(v) for v in values[6:]))
+
+
+C1_VALUE = "A"  # one of the 62 equally frequent alphanumeric values of C1
+D1_RELATIVE_TOLERANCE = 1e-12
 
 READ_CHECKSUM_DUCK = (
     "SELECT count(*), coalesce(sum(id), 0), coalesce(sum(length(v1)), 0), count(*) - count(d1), "
-    "coalesce(sum(length(clob1)), 0) FROM {table};"
+    "coalesce(sum(length(clob1)), 0), CAST(coalesce(sum(d1), 0) AS VARCHAR), "
+    "coalesce(sum(epoch_us(dt1) // 1000000), 0), coalesce(sum(epoch_us(ts1)), 0), "
+    f"count(*) FILTER (WHERE c1 = '{C1_VALUE}') FROM {{table}};"
 )
-# Same values on casts, for methods that load numbers or text as other types (e.g. NUMBER as VARCHAR)
+# Same values on casts, for methods that load numbers or text as other types (e.g. NUMBER as VARCHAR); D1 is summed
+# as DECIMAL(38,9), so a D1 loaded as DOUBLE only differs by the rounding of each value
 READ_CHECKSUM_DUCK_CAST = (
     "SELECT count(*), coalesce(sum(CAST(id AS HUGEINT)), 0), coalesce(sum(length(CAST(v1 AS VARCHAR))), 0), "
-    "count(*) - count(d1), coalesce(sum(length(CAST(clob1 AS VARCHAR))), 0) FROM {table};"
+    "count(*) - count(d1), coalesce(sum(length(CAST(clob1 AS VARCHAR))), 0), "
+    "CAST(coalesce(sum(CAST(d1 AS DECIMAL(38,9))), 0) AS VARCHAR), "
+    "coalesce(sum(epoch_us(CAST(dt1 AS TIMESTAMP)) // 1000000), 0), coalesce(sum(epoch_us(CAST(ts1 AS TIMESTAMP))), 0), "
+    f"count(*) FILTER (WHERE CAST(c1 AS VARCHAR) = '{C1_VALUE}') FROM {{table}};"
 )
+# The DuckDB type of D1 in the output table
+READ_D1_TYPE_DUCK = "SELECT data_type FROM duckdb_columns() WHERE table_name = '{table}' AND lower(column_name) = 'd1';"
+_TS1_SINCE_EPOCH = "(TS1 - TIMESTAMP '1970-01-01 00:00:00')"
 READ_CHECKSUM_ORACLE = (
     "SELECT COUNT(*), NVL(SUM(ID), 0), NVL(SUM(LENGTH(V1)), 0), COUNT(*) - COUNT(D1), "
-    "NVL(SUM(LENGTH(CLOB1)), 0) FROM {table} WHERE {where}"
+    "NVL(SUM(LENGTH(CLOB1)), 0), TO_CHAR(NVL(SUM(D1), 0), 'TM9'), "
+    "TO_CHAR(NVL(SUM(ROUND((DT1 - DATE '1970-01-01') * 86400)), 0), 'TM9'), "
+    f"TO_CHAR(NVL(SUM(EXTRACT(DAY FROM {_TS1_SINCE_EPOCH}) * 86400000000 "
+    f"+ EXTRACT(HOUR FROM {_TS1_SINCE_EPOCH}) * 3600000000 + EXTRACT(MINUTE FROM {_TS1_SINCE_EPOCH}) * 60000000 "
+    f"+ EXTRACT(SECOND FROM {_TS1_SINCE_EPOCH}) * 1000000), 0), 'TM9'), "
+    f"COUNT(CASE WHEN C1 = '{C1_VALUE}' THEN 1 END) FROM {{table}} WHERE {{where}}"
 )
+
+
+def compare_checksums(expected: ReadChecksums, got: ReadChecksums, d1_decimal: bool) -> tuple[bool, str]:
+    """(equal, how D1 was compared): D1's sum exactly when the method loaded D1 as DECIMAL, else within a relative
+    D1_RELATIVE_TOLERANCE (a DOUBLE cannot hold every NUMBER(25,9)); every other value exactly."""
+    others = all(getattr(expected, f.name) == getattr(got, f.name) for f in fields(ReadChecksums) if f.name != "sum_d1")
+    want, have = Decimal(expected.sum_d1), Decimal(got.sum_d1)
+    if d1_decimal:
+        return others and want == have, "exact"
+    close = abs(have - want) <= Decimal(repr(D1_RELATIVE_TOLERANCE)) * abs(want)
+    return others and close, f"relative {D1_RELATIVE_TOLERANCE:g}"
 
 
 def clob_fill_sql(table: str, ncols: int, percent: int = 2) -> str:

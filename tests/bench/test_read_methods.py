@@ -134,7 +134,7 @@ def test_only_option():
 
 def test_runner_records_skips_and_errors(tmp_path):
     from oraduck_bench import duck, read_runner
-    ok = read_schema_checksums = read_runner.read_schema.ReadChecksums(1, 1, 1, 0, 1)
+    ok = read_runner.read_schema.ReadChecksums(1, 1, 1, 0, 1, "1.5", 1, 1, 1)
 
     def run_method(cfg, method, table, threads, where, timeout_s):
         if method == "connectorx":
@@ -146,7 +146,8 @@ def test_runner_records_skips_and_errors(tmp_path):
     out = tmp_path / "r.jsonl"
     records = read_runner.run_read_case(
         CFG, 10, 50, ["oraduck", "connectorx", "rinie_oracle"], 1, out, warmup=False, ensure=lambda *a: "RD_10_50",
-        run_method=run_method, duck_checksums=lambda: ok, oracle_checksums=lambda *a: ok)
+        run_method=run_method, duck_checksums=lambda: ok, duck_d1_decimal=lambda: True,
+        oracle_checksums=lambda *a: ok)
     assert [(r["type"], r["method"]) for r in records] == [
         ("measure", "oraduck"), ("skipped", "connectorx"), ("error", "rinie_oracle")]
     assert records[1]["reason"] == "result does not fit in memory"
@@ -155,14 +156,14 @@ def test_runner_records_skips_and_errors(tmp_path):
 
 def test_runner_reports_a_competitor_with_wrong_data_and_raises_for_oraduck(tmp_path):
     from oraduck_bench import read_runner
-    ok = read_runner.read_schema.ReadChecksums(1, 1, 1, 0, 1)
-    bad = read_runner.read_schema.ReadChecksums(1, 1, 1, 0, 0)
+    ok = read_runner.read_schema.ReadChecksums(1, 1, 1, 0, 1, "1.5", 1, 1, 1)
+    bad = read_runner.read_schema.ReadChecksums(1, 1, 1, 0, 0, "1.5", 1, 1, 1)
 
     def run_method(cfg, method, table, threads, where, timeout_s):
         return read_methods.Measurement(method, table, 0, 0, threads, 1.0, None, {})
 
     kwargs = dict(warmup=False, ensure=lambda *a: "RD_10_50", run_method=run_method,
-                  oracle_checksums=lambda *a: ok)
+                  duck_d1_decimal=lambda: True, oracle_checksums=lambda *a: ok)
     records = read_runner.run_read_case(CFG, 10, 50, ["rinie_oracle"], 1, tmp_path / "a.jsonl",
                                         duck_checksums=lambda: bad, **kwargs)
     assert records[0]["type"] == "mismatch" and "got" in records[0]["message"]

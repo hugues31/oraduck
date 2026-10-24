@@ -204,6 +204,11 @@ def _competitors_section(local: dict[Group, list[dict]], events: list[dict], out
                          f"{_extra(runs, 'duckdb')} | {_median(runs):.3f} | {_span(runs)} | "
                          f"{nrows / _median(runs):,.0f} | {speedup} |")
     lines.append("")
+    tolerant = sorted({label(k[2]) for k, runs in local.items()
+                       if any(r.get("d1_comparison", "exact") != "exact" for r in runs)})
+    if tolerant:
+        lines += [f"The sum of D1 (`NUMBER(25,9)`) is compared exactly, except within a relative 1e-12 for the methods "
+                  f"that do not load it as `DECIMAL`: {', '.join(tolerant)}.", ""]
     if others:
         lines += ["Not ranked:", ""] + _event_lines(others) + [""]
     if _competitors_chart(local, cases, out_dir):

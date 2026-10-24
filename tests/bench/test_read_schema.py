@@ -34,10 +34,38 @@ def test_oracle_ddl_is_list_partitioned_with_a_subpartition_template():
     assert ddl.count("VALUES (DEFAULT)") == 2  # DEFAULT partition and DEFAULT subpartition
 
 
-def test_checksums_cover_the_five_aggregates():
-    assert "length(clob1)" in read_schema.READ_CHECKSUM_DUCK
-    assert "LENGTH(CLOB1)" in read_schema.READ_CHECKSUM_ORACLE
-    assert "{where}" in read_schema.READ_CHECKSUM_ORACLE
+def test_checksums_cover_every_aggregate():
+    duck, cast, ora = (read_schema.READ_CHECKSUM_DUCK, read_schema.READ_CHECKSUM_DUCK_CAST,
+                       read_schema.READ_CHECKSUM_ORACLE)
+    assert "length(clob1)" in duck and "LENGTH(CLOB1)" in ora and "{where}" in ora
+    # D1 summed exactly, as text; DT1 in epoch seconds, TS1 in epoch microseconds; C1 compared with a value
+    assert "CAST(coalesce(sum(d1), 0) AS VARCHAR)" in duck and "TO_CHAR(NVL(SUM(D1), 0), 'TM9')" in ora
+    assert "sum(CAST(d1 AS DECIMAL(38,9)))" in cast
+    assert "epoch_us(dt1) // 1000000" in duck and "ROUND((DT1 - DATE '1970-01-01') * 86400)" in ora
+    assert "sum(epoch_us(ts1))" in duck and "EXTRACT(SECOND FROM (TS1 - TIMESTAMP '1970-01-01 00:00:00')) * 1000000" in ora
+    assert "c1 = 'A'" in duck and "C1 = 'A'" in ora and "CAST(c1 AS VARCHAR) = 'A'" in cast
+    for sql in (duck, cast, ora):
+        assert sql.count(",") >= 8  # nine values, in the order of ReadChecksums
+
+
+def test_checksums_from_a_row():
+    sums = read_schema.ReadChecksums.from_row(["10", "55", "100", "1", "7", "123.450000000", "-86400", "5000000", "3"])
+    assert sums == read_schema.ReadChecksums(10, 55, 100, 1, 7, "123.450000000", -86400, 5000000, 3)
+
+
+def test_d1_is_compared_exactly_for_a_decimal_and_with_a_tolerance_otherwise():
+    oracle = read_schema.ReadChecksums(10, 55, 100, 1, 7, "52345678901.123456789", 1, 2, 3)
+    same = read_schema.ReadChecksums(10, 55, 100, 1, 7, "52345678901.123456789000", 1, 2, 3)
+    assert read_schema.compare_checksums(oracle, same, True) == (True, "exact")
+    near = read_schema.ReadChecksums(10, 55, 100, 1, 7, "52345678901.12346", 1, 2, 3)  # a DOUBLE's sum
+    assert read_schema.compare_checksums(oracle, near, True) == (False, "exact")
+    assert read_schema.compare_checksums(oracle, near, False) == (True, "relative 1e-12")
+    far = read_schema.ReadChecksums(10, 55, 100, 1, 7, "52345678901.2", 1, 2, 3)
+    assert read_schema.compare_checksums(oracle, far, False) == (False, "relative 1e-12")
+    other = read_schema.ReadChecksums(10, 55, 100, 1, 7, "52345678901.123456789", 1, 2, 4)
+    assert read_schema.compare_checksums(oracle, other, True) == (False, "exact")
+    zero = read_schema.ReadChecksums(0, 0, 0, 0, 0, "0", 0, 0, 0)
+    assert read_schema.compare_checksums(zero, zero, False) == (True, "relative 1e-12")
 
 
 def test_fakelake_yaml_skips_computed_columns():

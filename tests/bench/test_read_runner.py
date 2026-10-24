@@ -5,7 +5,7 @@ import pytest
 from oraduck_bench import config, duck, read_runner, read_schema
 
 CFG = config.OracleConfig("bench", "pw", "host:1521/svc")
-SUMS = read_schema.ReadChecksums(10, 55, 100, 1, 7)
+SUMS = read_schema.ReadChecksums(10, 55, 100, 1, 7, "12.5", 3, 4, 2)
 
 
 class FakeRun:
@@ -21,12 +21,12 @@ class FakeRun:
         return Measurement(method, table, 10, 5, threads, 1.5, None, {})
 
 
-def run(tmp_path, methods, runs=2, duck_sums=SUMS, timeouts=None, fake=None, **kw):
+def run(tmp_path, methods, runs=2, duck_sums=SUMS, timeouts=None, fake=None, d1_decimal=True, **kw):
     fake = fake or FakeRun()
     records = read_runner.run_read_case(
         CFG, 10, 5, methods, runs, tmp_path / "r.jsonl", timeouts=timeouts if timeouts is not None else set(),
         ensure=lambda cfg, n, c: "RD_10_5", run_method=fake, duck_checksums=lambda: duck_sums,
-        oracle_checksums=lambda cfg, table, where: SUMS, **kw)
+        duck_d1_decimal=lambda: d1_decimal, oracle_checksums=lambda cfg, table, where: SUMS, **kw)
     return records, fake
 
 
@@ -45,7 +45,19 @@ def test_no_warm_up(tmp_path):
 
 def test_checksum_mismatch_raises(tmp_path):
     with pytest.raises(read_runner.ChecksumMismatch):
-        run(tmp_path, ["oraduck"], duck_sums=read_schema.ReadChecksums(10, 55, 100, 1, 8))
+        run(tmp_path, ["oraduck"], duck_sums=read_schema.ReadChecksums(10, 55, 100, 1, 8, "12.5", 3, 4, 2))
+    with pytest.raises(read_runner.ChecksumMismatch, match="exact"):  # D1 loaded as DECIMAL: no tolerance
+        run(tmp_path, ["oraduck"], duck_sums=read_schema.ReadChecksums(10, 55, 100, 1, 7, "12.5000000000001", 3, 4, 2))
+
+
+def test_d1_comparison_is_recorded(tmp_path):
+    records, _ = run(tmp_path, ["oraduck"], runs=1, warmup=False)
+    assert records[0]["d1_comparison"] == "exact"
+    near = read_schema.ReadChecksums(10, 55, 100, 1, 7, "12.5000000000001", 3, 4, 2)
+    records, _ = run(tmp_path, ["x"], runs=1, warmup=False, duck_sums=near, d1_decimal=False)
+    assert records[0]["type"] == "measure" and records[0]["d1_comparison"] == "relative 1e-12"
+    records, _ = run(tmp_path, ["x"], runs=1, warmup=False, duck_sums=near, d1_decimal=True)
+    assert records[0]["type"] == "mismatch" and "D1 compared: exact" in records[0]["message"]
 
 
 def test_timeout_is_recorded_then_the_method_is_skipped(tmp_path):

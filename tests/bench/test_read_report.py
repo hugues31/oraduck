@@ -56,6 +56,15 @@ def test_four_tables_utilisation_and_criteria(tmp_path):
     assert (tmp_path / "report_read_shaped.png").exists()
 
 
+def test_tolerant_d1_comparison_is_stated(tmp_path):
+    data = rows()
+    assert "relative 1e-12" not in report(tmp_path, data)
+    for record in data:
+        if record.get("method") == "quack_oracle":
+            record["d1_comparison"] = "relative 1e-12"
+    assert "within a relative 1e-12 for the methods that do not load it as `DECIMAL`: quack-oracle." in report(tmp_path, data)
+
+
 def test_planning_share(tmp_path):
     text = report(tmp_path, rows())
     # 100 ms of a 1.100 s median: 9.1 %
@@ -113,7 +122,7 @@ def test_empty_results_do_not_crash(tmp_path):
 
 def test_runner_fills_link_bytes_and_shaping(tmp_path):
     from oraduck_bench.read_methods import Measurement
-    sums = read_schema.ReadChecksums(1, 2, 3, 4, 5)
+    sums = read_schema.ReadChecksums(1, 2, 3, 4, 5, "6.5", 7, 8, 9)
     counter = iter([1000, 126_000_000]).__next__
 
     def run_method(cfg, method, table, threads, where, timeout_s):
@@ -121,7 +130,7 @@ def test_runner_fills_link_bytes_and_shaping(tmp_path):
 
     records = read_runner.run_read_case(
         config.OracleConfig("u", "pw", "h:1/s"), 10, 5, ["oraduck"], 1, tmp_path / "r.jsonl", warmup=False,
-        ensure=lambda *a: "RD_10_5", run_method=run_method, duck_checksums=lambda: sums,
+        ensure=lambda *a: "RD_10_5", run_method=run_method, duck_checksums=lambda: sums, duck_d1_decimal=lambda: True,
         oracle_checksums=lambda *a: sums, link_counter=counter, shaping=SHAPING, variant="compression",
         planning=lambda *a: 12.5)
     assert records[0]["link_bytes"] == 125_999_000
