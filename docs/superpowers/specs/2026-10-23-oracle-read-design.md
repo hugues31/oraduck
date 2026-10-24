@@ -149,7 +149,7 @@ Options (named parameters):
 | `sessions` | DuckDB `threads` | Maximum number of Oracle sessions |
 | `split` | `'auto'` | Parallel strategy: `'auto'`, `'extents'`, `'hash'`, `'none'` (4.4) |
 | `unconstrained_number` | `'DOUBLE'` | DuckDB type for `NUMBER` without precision and `FLOAT`: `'DOUBLE'`, `'VARCHAR'` or `'DECIMAL(p,s)'` (5.3) |
-| `snapshot` | `'none'` | Read consistency across sessions: `'auto'`, `'scn'`, `'none'` (4.5; `'auto'` until the measurement of 4.5 set it to `'none'`) |
+| `snapshot` | `'auto'` | Read consistency across sessions: `'auto'`, `'scn'`, `'none'` (4.5) |
 
 Tuning parameters (fetch buffer budget, prefetch size, rows per fetch) are left
 to the builder; expose them only if the benchmark shows a need, with defaults
@@ -276,12 +276,12 @@ warning/log line. `'scn'` makes the refusal an error; `'none'` never uses
 `AS OF`. The builder checks that `AS OF SCN` does not cost throughput or
 pruning; if it does, the default becomes `'none'` and the report says why.
 
-Outcome (final fix wave, `docs/probe-results.md` R8): the default is `'none'`.
-`AS OF SCN` costs no throughput, but each session hard-parses the unit
-statement (Oracle never shares a flashback cursor between parse calls) and
-these parses run one after another: +62 % on a 12-subpartition, 550-column
-table read by 8 sessions, above the 5 % rule. A scan of one unit never uses a
-snapshot (one statement is read-consistent).
+Outcome (`docs/probe-results.md` R6, R8): the default stays `'auto'`. `AS OF
+SCN` costs no throughput (+0.3 % on a 1M-row partition); its cost is fixed per
+scan: each session hard-parses the unit statement (Oracle never shares a
+flashback cursor between parse calls) and the sessions parse in turn, about
+13 ms per session for 550 columns, which `'none'` avoids for tiny reads. A
+scan of one unit never uses a snapshot (one statement is read-consistent).
 
 ### 4.6 Errors and interrupts
 

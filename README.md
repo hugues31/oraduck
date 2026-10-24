@@ -244,7 +244,7 @@ SELECT * FROM ora.MY_SCHEMA.TOTO WHERE part_date = DATE '2024-05-07';
 | `SECRET` | required | name of an `oraduck` secret |
 | `SESSIONS` | `SET threads` | Oracle sessions per scan (1 to 1024) |
 | `SPLIT` | `auto` | how a scan is divided between sessions: `auto`, `extents`, `hash`, `none` |
-| `SNAPSHOT` | `none` | read consistency across sessions: `none`, `auto`, `scn` (see [How a read runs](#how-a-read-runs)) |
+| `SNAPSHOT` | `auto` | read consistency across sessions: `auto`, `scn`, `none` (see [How a read runs](#how-a-read-runs)) |
 | `UNCONSTRAINED_NUMBER` | `DOUBLE` | DuckDB type of a `NUMBER` without precision: `DOUBLE`, `VARCHAR`, `DECIMAL(p,s)` |
 
 The options after `SECRET` have the same meaning as the `oraduck_scan`
@@ -278,7 +278,7 @@ SELECT * FROM oraduck_scan('TOTO', connection := 'oracle_prod',
 ```
 
 `oraduck_scan('<[SCHEMA.]TABLE>', connection := '<secret>' [, sessions := n]
-[, split := 'auto'|'extents'|'hash'|'none'] [, snapshot := 'none'|'auto'|'scn']
+[, split := 'auto'|'extents'|'hash'|'none'] [, snapshot := 'auto'|'scn'|'none']
 [, unconstrained_number := 'DOUBLE'|'VARCHAR'|'DECIMAL(p,s)'])`
 
 `connection` is required. The name is read like the COPY target (unquoted
@@ -326,7 +326,7 @@ EXPLAIN SELECT * FROM ora.MY_SCHEMA.TOTO WHERE part_date = DATE '2024-05-07';
 -- Table: MY_SCHEMA.TOTO
 -- Oracle WHERE: ("PART_DATE" = DATE '2024-05-07')
 -- Split: auto
--- Snapshot: none
+-- Snapshot: auto
 ```
 
 **Parallel sessions.** A scan opens up to `SESSIONS` Oracle sessions (default:
@@ -348,27 +348,28 @@ failure falls back to `hash`, and `hash` to one session, with a note; with an
 explicit `SPLIT`, it is an error.
 
 **Consistency.** Each work unit is one Oracle statement, consistent by itself.
-By default (`SNAPSHOT 'none'`) the units run at different moments: while
-Oracle is being written, a change committed during the scan is seen by the
-units that start after it and not by the others, and with row movement enabled
-a row that moves during the scan (partition key update, shrink) can be missed
-or read twice. With `SNAPSHOT 'auto'`, every unit reads `AS OF SCN` of one
-SCN, read at planning time, when the user has `EXECUTE ON DBMS_FLASHBACK` or
+With `SNAPSHOT 'auto'` (the default), every unit reads `AS OF SCN` of one SCN,
+read at planning time, when the user has `EXECUTE ON DBMS_FLASHBACK` or
 `SELECT ON V_$DATABASE`: the sessions see the same data even when Oracle is
-being written.
-Without that privilege, or when a flashback query is refused, each session
-reads at its own moment, and the scan says so in its `Snapshot` and `Notes` in
-`EXPLAIN ANALYZE` and as a warning in the DuckDB log. `snapshot := 'scn'` turns
-that situation into an error. Flashback query needs `FLASHBACK` on another
-user's table. A scan of one unit (one session, `SPLIT 'none'`, a small table)
-never uses an SCN.
+being written. Without that privilege, or when a flashback query is refused,
+each session reads at its own moment, and the scan says so in its `Snapshot`
+and `Notes` in `EXPLAIN ANALYZE` and as a warning in the DuckDB log.
+`snapshot := 'scn'` turns that situation into an error; `'none'` never uses an
+SCN. Flashback query needs `FLASHBACK` on another user's table. A scan of one
+unit (one session, `SPLIT 'none'`, a small table) never uses an SCN.
 
-The snapshot is not the default because of a fixed cost: Oracle never shares a
+Without an SCN the units run at different moments: while Oracle is being
+written, a change committed during the scan is seen by the units that start
+after it and not by the others, and with row movement enabled a row that moves
+during the scan (partition key update, shrink) can be missed or read twice.
+
+The snapshot has a fixed cost per scan, not per row: Oracle never shares a
 flashback (`AS OF`) cursor between parse calls, so each session hard-parses
-the unit statement, and these parses run one after another: about 13 ms per
-session for 550 columns (0.12 s for 8 sessions, more with more sessions). That
-is +62 % on a small partitioned table and within noise on a 1M-row, 50-column
-partition ([`docs/probe-results.md`](docs/probe-results.md), R8).
+the unit statement, and the sessions parse in turn: about 13 ms per session
+for 550 columns (0.12 s for 8 sessions, more with more sessions). It is within
+noise on a 1M-row partition; on a tiny read (a few rows over many partitions)
+it can be most of the time, and `snapshot := 'none'` avoids it
+([`docs/probe-results.md`](docs/probe-results.md), R8).
 
 `EXPLAIN ANALYZE` adds what the run did:
 
@@ -390,7 +391,7 @@ For the reading user:
 |---|---|
 | `SELECT` on the tables | required |
 | `SELECT ON SYS.DBA_EXTENTS` | best splitting (without it, `DBMS_PARALLEL_EXECUTE` is tried) |
-| `EXECUTE ON SYS.DBMS_FLASHBACK` | consistent parallel reads with `SNAPSHOT 'auto'` or `'scn'` (`SELECT ON V_$DATABASE` also works) |
+| `EXECUTE ON SYS.DBMS_FLASHBACK` | consistent parallel reads (`SELECT ON V_$DATABASE` also works) |
 
 ### Read types
 

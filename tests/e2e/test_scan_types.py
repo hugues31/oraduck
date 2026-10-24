@@ -229,7 +229,7 @@ def test_explain_shows_requested_options(table):
     assert info["Oracle WHERE"] == "—"
     assert (info["Split"], info["Snapshot"]) == ("hash", "none")
     (info,) = explain_scan(f"SELECT a FROM {scan_call(table.name)}")
-    assert (info["Split"], info["Snapshot"]) == ("auto", "none")
+    assert (info["Split"], info["Snapshot"]) == ("auto", "auto")
 
 
 @pytest.mark.parametrize("form", ["table", "owner.table lower case", "quoted"])

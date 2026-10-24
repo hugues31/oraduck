@@ -46,14 +46,19 @@ def test_split_strategies_agree(million, split):
     assert float(info["Planning (ms)"]) >= 0
 
 
-def test_no_snapshot_by_default(million):
-    """SNAPSHOT_DEFAULT = none: each session reads at its own moment, without AS OF SCN, and no warning says so."""
+def test_snapshot_by_default(million):
+    """SNAPSHOT_DEFAULT = auto: a scan of several units reads AS OF one SCN; snapshot 'none' reads without one (no
+    per-session hard parse of a flashback cursor), and no warning says so."""
     call = scan_call(million.name)
     (info,) = explain_scan(f"SELECT sum(id) FROM {call}", setup=THREADS)
-    assert info["Snapshot"] == "none"
+    assert info["Snapshot"] == "auto"
     (info,) = explain_scan(f"SELECT sum(id) FROM {call}", setup=THREADS, analyze=True)
+    assert int(info["Units"]) > 1 and info["Snapshot"].isdigit(), info
+    assert f'AS OF SCN TO_NUMBER(\'{info["Snapshot"]}\')' in info["Oracle SQL"]
+    no_snapshot = scan_call(million.name, "snapshot := 'none'")
+    (info,) = explain_scan(f"SELECT sum(id) FROM {no_snapshot}", setup=THREADS, analyze=True)
     assert int(info["Units"]) > 1 and info["Snapshot"] == "per session" and "AS OF" not in info["Oracle SQL"], info
-    rows, warnings = scan_output(f"SELECT count(*) AS n FROM {call}", setup=THREADS)
+    rows, warnings = scan_output(f"SELECT count(*) AS n FROM {no_snapshot}", setup=THREADS)
     assert rows == [{"n": MILLION}] and warnings == []
 
 

@@ -352,10 +352,11 @@ another, against 30–35 ms with one text per session. On a large read the cost 
 `RD_1000000_50` (50 columns), target partition (1,000,000 rows), 8 sessions, `SELECT *` discarded: 2.03 s with
 `AS OF` against 2.29 s without, median of the per-pair ratios +0.3 % (5 pairs, runs from 1.8 to 2.8 s).
 
-Decision: the rule (keep `auto` only if `AS OF SCN` costs at most 5 % on this table) sets `SNAPSHOT_DEFAULT = none`:
-the snapshot adds about 0.12 s to an 8-session scan (13 ms per session for 550 columns), +62 % here, and
-more with more sessions; it stays available with `snapshot := 'auto'` or `'scn'`. One text per session (a session
-number in the comment) would cut the 8-session cost to about 30 ms, still above 5 % of this scan.
+Decision (controller ruling): `SNAPSHOT_DEFAULT` stays `auto`. The 5 % rule applies to realistic reads, where
+`AS OF SCN` is within noise (+0.3 % on the 1M-row partition; R6: +0.2 % to +2.7 %), not to a 12-row table where a
+fixed cost dominates. That fixed cost is one hard parse per session, the sessions parsing in turn: about 13 ms per
+session for 550 columns, 0.12 s for 8 sessions; `snapshot := 'none'` avoids it for tiny reads. One text per session
+(a session number in the comment) would let the parses run in parallel (about 30 ms for 8 sessions); not done.
 
 ### Findings for the next tasks
 
@@ -398,4 +399,4 @@ number in the comment) would cut the 8-session cost to about 30 ms, still above 
 | `LOB_TECHNIQUE` | `lob_prefetch` | R4: the only correct technique without per-value round trips: 1.0 request per 1,000 small rows, every value exact including 1.4/3.0 MB multi-byte values and `EMPTY_CLOB()`; `dynamic_define` fails (`SQLT_LVC`: ORA-24370; `SQLT_CHR`: U+FFFD for supplementary characters, `EMPTY_CLOB()` read as NULL); `substr_locator`: 631 requests per 1,000 small rows |
 | `FETCH_BUDGET_BYTES` | `67108864` | R3: 64 MiB is the fastest budget on the 550-column table (7.77 s against 8.03 s at 256 MiB and 8.23 s at 16 MiB; first run 8.31/8.44/8.88 s), 82 rows and 521 KB per round trip, 12 % less client CPU than 256 MiB |
 | `PREFETCH_MEMORY_BYTES` | `0` | R3: no non-zero value is faster beyond noise (best: −1 % at 256 MiB, where it changes no round trip). At 16 and 64 MiB it adds +3 to +14 % (wide rows); on narrow rows it adds +57 to +81 %, while larger define arrays cut round trips at no cost. Prefetch memory is sized from declared widths, so it only adds what a larger define array adds, plus a copy |
-| `SNAPSHOT_DEFAULT` | `none` | R8 (supersedes R6's `auto`): each session hard-parses the `AS OF SCN` statement, one session after another (Oracle never shares a flashback cursor between parse calls): +62 % on the 12-subpartition 550-column table with 8 sessions (0.322 s against 0.199 s, 13 ms per session), above the 5 % rule; within noise on a 1M-row partition (+0.3 %). R6: throughput cost +0.6 % (workload scan), +0.2 % (full scan), +2.7 % (4 sessions), same consistent gets |
+| `SNAPSHOT_DEFAULT` | `auto` | R6: `AS OF SCN` costs +0.6 % (workload scan), +0.2 % (full scan) and +2.7 % (4 sessions), within noise floors of −0.1 to +3.4 % and below 5 %; same consistent gets (pruning intact). R8: +0.3 % on a 1M-row partition with 8 sessions; a fixed cost of one hard parse per session (13 ms for 550 columns, sessions in turn: +62 % on a 12-row, 550-column table with 8 sessions), which `snapshot := 'none'` avoids for tiny reads |
