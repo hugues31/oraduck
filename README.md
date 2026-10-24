@@ -20,22 +20,25 @@ TO 'MY_SCHEMA.MY_TABLE' (FORMAT ORADUCK, CONNECTION 'oracle_test');
 
 The reader is described in [Read from Oracle](#read-from-oracle).
 
-Write benchmark: on Oracle 19c, over 9 table shapes from 100k × 5 to 10M × 50, OraDuck is:
+## Performance
 
-- 1.2 to 3.2 times faster than exporting the table to CSV files and loading
-  them with parallel direct path `sqlldr` (median of 5 runs);
-- 6 to 48 times faster than [quack-oracle](https://github.com/krokozyab/quack-oracle)
-  and 240 to 500 times faster than [duckdb-oracle](https://github.com/rinie/duckdb-oracle),
-  the other DuckDB extensions that write to Oracle (from an in-memory table,
-  median of 3 runs; duckdb-oracle takes more than 15 minutes from 1M rows).
+Oracle 19c, 1M rows × 50 columns, client and server on the same laptop (no
+network), median times, OraDuck with 8 Oracle sessions:
 
-See [`bench/REPORT.md`](bench/REPORT.md).
+| Direction | OraDuck | Compared with | OraDuck is |
+|---|---|---|---|
+| **Read**: Oracle → DuckDB table | **6.2 s** | python-oracledb thin 18.5 s · ConnectorX 19.2 s · [quack-oracle](https://github.com/krokozyab/quack-oracle) 30.7 s · SQL\*Plus CSV + `read_csv` 106.9 s | **3.0 to 17× faster** |
+| **Write**: DuckDB table → Oracle | **3.9 s** | CSV export + parallel direct path SQL\*Loader 7.2 s | **1.9× faster** |
+| **Write**: in-memory table → Oracle | **2.0 s** | quack-oracle 92.3 s · [duckdb-oracle](https://github.com/rinie/duckdb-oracle) > 15 min (already from 1M × 5) | **45× faster** |
 
-Read benchmark: on 1M rows × 50 columns, OraDuck reads 3.0 times faster than
-python-oracledb (thin), 3.1 times faster than ConnectorX and 5.0 times faster
-than quack-oracle (OraDuck with 8 sessions: median of 8 runs; the others: median
-of 3 runs); see
-[`bench/REPORT_READ.md`](bench/REPORT_READ.md).
+Over every measured shape, writes are 1.2 to 3.2 times faster than SQL\*Loader
+(100k × 5 to 10M × 50), 6 to 48 times faster than quack-oracle and 240 to 500
+times faster than duckdb-oracle; when reading, duckdb-oracle returns an empty
+CLOB column and is not ranked. Even with a single session, OraDuck reads faster
+than every single-session method. Protocols, all cases and limits:
+[`bench/REPORT_READ.md`](bench/REPORT_READ.md) (read, DuckDB 2.0.0) and
+[`bench/REPORT.md`](bench/REPORT.md) (write, measured with OraDuck 0.3.0 on
+DuckDB 1.5.5).
 
 ## Install
 
