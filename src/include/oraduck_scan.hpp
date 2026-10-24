@@ -21,7 +21,9 @@ struct OraduckScanOptions {
 	uint32_t sessions = 0; // 0: DuckDB's number of threads
 	oraduck::SplitStrategy split = oraduck::SplitStrategy::kAuto;
 	oraduck::UnconstrainedNumber unconstrained;
-	oraduck::SnapshotMode snapshot = oraduck::SnapshotMode::kAuto;
+	// 'none' (SNAPSHOT_DEFAULT, docs/probe-results.md R8): AS OF SCN costs each session a hard parse of the unit
+	// statement, one session after another
+	oraduck::SnapshotMode snapshot = oraduck::SnapshotMode::kNone;
 };
 
 struct OraduckScanBindData : public TableFunctionData {

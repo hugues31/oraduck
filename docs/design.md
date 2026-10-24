@@ -217,10 +217,14 @@ Reading is the mirror of the load: `ATTACH '' AS ora (TYPE oraduck, SECRET s)`
 or `oraduck_scan('[SCHEMA.]TABLE', connection := 's')` describes the source at
 bind time, plans the work when the query starts, then fetches the work units
 (ROWID ranges or hash buckets) in parallel, one Oracle session per DuckDB
-thread, each statement running `AS OF SCN` of one common SCN when the user may
-read it. Projections are pushed; filters are pushed only when the translation
-is provably equivalent in Oracle, the others stay in DuckDB. User documentation:
-the README section "Read from Oracle".
+thread, each session parsing the unit statement once and running it for each
+unit it takes. With `snapshot` `'auto'` or `'scn'` every unit runs `AS OF SCN`
+of one common SCN when the user may read it; the default, `'none'`, lets each
+unit read at its own moment (the snapshot costs one hard parse per session:
+[`probe-results.md`](probe-results.md), R8). Projections are pushed; filters
+are pushed only when the translation is provably equivalent in Oracle, the
+others stay in DuckDB. User documentation: the README section "Read from
+Oracle".
 
 - Design and decisions: [`docs/superpowers/specs/2026-10-23-oracle-read-design.md`](superpowers/specs/2026-10-23-oracle-read-design.md).
 - OCI measurements behind the fetch choices: [`docs/probe-results.md`](probe-results.md), section "Read path".

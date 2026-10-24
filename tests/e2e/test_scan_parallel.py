@@ -19,7 +19,7 @@ def oracle_totals(table) -> tuple[int, int, int]:
 
 @pytest.mark.parametrize("split", ["extents", "hash", "none"])
 def test_split_strategies_agree(million, split):
-    call = scan_call(million.name, f"split := '{split}'")
+    call = scan_call(million.name, f"split := '{split}', snapshot := 'auto'")
     rows = scan_json(f"SELECT count(*) AS n, sum(id)::BIGINT AS s, count(DISTINCT id) AS d FROM {call}", setup=THREADS)
     assert (rows[0]["n"], rows[0]["s"], rows[0]["d"]) == oracle_totals(million) == (MILLION, SUM, MILLION)
 
@@ -46,6 +46,17 @@ def test_split_strategies_agree(million, split):
     assert float(info["Planning (ms)"]) >= 0
 
 
+def test_no_snapshot_by_default(million):
+    """SNAPSHOT_DEFAULT = none: each session reads at its own moment, without AS OF SCN, and no warning says so."""
+    call = scan_call(million.name)
+    (info,) = explain_scan(f"SELECT sum(id) FROM {call}", setup=THREADS)
+    assert info["Snapshot"] == "none"
+    (info,) = explain_scan(f"SELECT sum(id) FROM {call}", setup=THREADS, analyze=True)
+    assert int(info["Units"]) > 1 and info["Snapshot"] == "per session" and "AS OF" not in info["Oracle SQL"], info
+    rows, warnings = scan_output(f"SELECT count(*) AS n FROM {call}", setup=THREADS)
+    assert rows == [{"n": MILLION}] and warnings == []
+
+
 def test_sessions_option_caps_the_sessions(million):
     call = scan_call(million.name, "sessions := 3, split := 'hash'")
     (info,) = explain_scan(f"SELECT sum(id) FROM {call}", setup=THREADS, analyze=True)
@@ -63,7 +74,7 @@ def test_reader_uses_parallel_execute_chunks(million, oracle):
         cur.execute(f"CREATE VIEW {view} AS SELECT ID, PAD FROM {million.name}")
         cur.execute(f"GRANT SELECT ON {view} TO {env('ORADUCK_ORACLE_READER_USER')}")
     try:
-        call = scan_call(f"{owner()}.{million.name}")
+        call = scan_call(f"{owner()}.{million.name}", "snapshot := 'auto'")
         (info,) = explain_scan(f"SELECT sum(id) FROM {call}", setup=THREADS, analyze=True, reader=True)
         assert info["Strategy"] == "extents"
         assert "DBMS_PARALLEL_EXECUTE" in info["Notes"]
@@ -92,7 +103,7 @@ def test_reader_uses_parallel_execute_chunks(million, oracle):
         assert logs[0]["message"] == warnings[0]
 
         # One unit is one statement: consistent without an SCN, so no warning
-        single = scan_call(f"{owner()}.{million.name}", "split := 'none'")
+        single = scan_call(f"{owner()}.{million.name}", "split := 'none', snapshot := 'auto'")
         _, warnings = scan_output(f"SELECT count(*) AS n FROM {single}", setup=THREADS, reader=True)
         assert warnings == []
         (info,) = explain_scan(f"SELECT sum(id) FROM {single}", setup=THREADS, analyze=True, reader=True)
@@ -117,7 +128,7 @@ def test_one_parse_per_session_with_as_of_scn(oracle, table):
                   "PARTITION BY HASH (ID) PARTITIONS 32")
     fill_ids(table, rows, "ID, PAD", "n, 'row ' || n")
     wait_for_snapshot(table, rows)
-    call = scan_call(table.name, "sessions := 4")
+    call = scan_call(table.name, "sessions := 4, snapshot := 'auto'")
     (info,) = explain_scan(f"SELECT sum(id) FROM {call}", setup=THREADS, analyze=True)
     units = int(info["Units"])
     assert units >= 24 and info["Sessions"] == "4" and info["Snapshot"].isdigit(), info
