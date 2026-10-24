@@ -823,6 +823,70 @@ TEST_CASE("Fetch cursor: binds of every type and hash slices", "[oracle][fetch_c
 	CHECK(slice_sum == 500500);
 }
 
+TEST_CASE("Fetch cursor: run again with new binds, parsed once", "[oracle][fetch_cursor]") {
+	OciSession session(TestCredentials());
+	DropGuard guard {session, {"ITEST_FC_REEXEC"}};
+	guard.DropAll();
+	session.Execute("CREATE TABLE ITEST_FC_REEXEC (ID NUMBER(10), C CLOB)");
+	session.Execute("INSERT /*+ APPEND */ INTO ITEST_FC_REEXEC SELECT r, TO_CLOB('c' || r) FROM " +
+	                RowGenerator(1000));
+	ReadPlan plan(session, "ITEST_FC_REEXEC");
+	// A tag of this run in the text: V$SQL then shows this test's cursor only
+	const std::string tag =
+	    "itest " + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+	auto bucket = [&](uint32_t k) {
+		Slice slice;
+		slice.kind = SliceKind::kHash;
+		slice.hash_buckets = 4;
+		slice.hash_bucket = k;
+		SqlStatement statement = plan.Statement(plan.columns, slice);
+		const std::string head = "SELECT /* oraduck_scan */";
+		REQUIRE(statement.sql.compare(0, head.size(), head) == 0);
+		statement.sql.replace(0, head.size(), "SELECT /* oraduck_scan " + tag + " */");
+		return statement;
+	};
+	FetchOptions options;
+	options.max_rows = 100;
+	FetchCursor cursor(session, bucket(0), plan.columns, options);
+	CHECK(cursor.sql() == bucket(0).sql);
+	int64_t rows = 0, sum = 0, wrong = 0;
+	auto read = [&]() {
+		for (const auto &row : ReadAll(cursor, 2)) {
+			const int64_t id = Int64(row[0].bytes);
+			rows++;
+			sum += id;
+			wrong += row[1].bytes != "c" + std::to_string(id);
+		}
+	};
+	read();
+	for (uint32_t k = 1; k < 4; k++) {
+		cursor.Execute(bucket(k));
+		read();
+	}
+	CHECK(rows == 1000);
+	CHECK(sum == 500500);
+	CHECK(wrong == 0);
+	// Run again before the end of the rows: the rest of the previous execution is discarded
+	cursor.Execute(bucket(0));
+	CHECK(cursor.Fetch() > 0);
+	cursor.Execute(bucket(1));
+	int64_t bucket_rows = 0;
+	for (uint32_t n; (n = cursor.Fetch()) > 0;) {
+		bucket_rows += n;
+	}
+	CHECK(std::to_string(bucket_rows) == Scalar(session, "SELECT COUNT(*) FROM ITEST_FC_REEXEC WHERE ORA_HASH(ROWID, 3) = 1"));
+	// Another text is refused: the cursor runs its own statement only
+	CHECK_THROWS_AS(cursor.Execute(plan.statement), OraduckError);
+
+	const auto cursors = session.QueryStrings(
+	    "SELECT TO_CHAR(COUNT(*)), TO_CHAR(SUM(executions)), TO_CHAR(SUM(parse_calls)) FROM v$sql "
+	    "WHERE sql_text LIKE :1",
+	    {"SELECT /* oraduck_scan " + tag + " */%"});
+	CHECK(cursors[0][0] == "1"); // child cursors
+	CHECK(cursors[0][1] == "6"); // executions
+	CHECK(cursors[0][2] == "1"); // parse calls
+}
+
 TEST_CASE("Fetch cursor: varchar binds keep their trailing blanks", "[oracle][fetch_cursor]") {
 	OciSession session(TestCredentials());
 	DropGuard guard {session, {"ITEST_FC_BLANKS"}};

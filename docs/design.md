@@ -140,7 +140,7 @@ The read path adds these components (section 4.4):
 | Scan SQL (`read_sql`, `sql_binds`) | The statement of a work unit: projection, pushed filters, `AS OF SCN`, slice predicate, bind values. |
 | ROWID ranges (`rowid_ranges`) | ROWID range slices from extents: sizing and the ROWID bounds. |
 | Work planning (`work_units`) | Snapshot SCN, split strategy (`extents`, `hash`, `none`) and fallbacks: the work plan of a scan. |
-| Fetch cursor (`fetch_cursor`) | One statement on one session: defines, array fetch, LOB prefetch. |
+| Fetch cursor (`fetch_cursor`) | One statement on one session, parsed once and run again with the binds of each work unit: defines, array fetch, LOB prefetch. |
 | Scan glue (`oraduck_scan`, `oraduck_scan_filters`, `scan_vectors`) | The `oraduck_scan` table function: bind, plan, one session per thread, vectors, `EXPLAIN` output, filter pushdown. |
 | Catalog (`oraduck_catalog*`) | The `oraduck` storage extension: read-only catalog, schemas = Oracle users, lazily described tables. |
 

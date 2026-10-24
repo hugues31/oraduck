@@ -21,11 +21,12 @@ struct FetchOptions {
 	uint32_t lob_read_chunk_for_tests = 0;   // test only: characters (bytes) per OCILobRead2 call, 0 = whole value
 };
 
-// One query on one session: array fetches into define buffers sized by a byte budget, LOBs through
-// locators with LOB prefetch. Throws OracleError (OraduckError for an unusable column plan).
+// One query on one session, run once or again with other binds: array fetches into define buffers sized by a
+// byte budget, LOBs through locators with LOB prefetch. Throws OracleError (OraduckError for an unusable column
+// plan).
 class FetchCursor {
 public:
-	// Prepares, binds, defines (columns[i] at select-list position i + 1) and executes. With no column,
+	// Prepares, defines (columns[i] at select-list position i + 1) and runs Execute(statement). With no column,
 	// position 1 (the constant of BuildScanSql) is defined so that Fetch() still counts rows.
 	FetchCursor(OciSession &session, const SqlStatement &statement, std::vector<const ReadColumnPlan *> columns,
 	            const FetchOptions &options);
@@ -33,9 +34,20 @@ public:
 	FetchCursor(const FetchCursor &) = delete;
 	FetchCursor &operator=(const FetchCursor &) = delete;
 
+	// Binds statement's values and executes; its text must be sql() (OraduckError otherwise). The cursor is parsed
+	// once however often it runs: Oracle never shares a flashback (AS OF SCN) cursor between parse calls, so a
+	// prepare per run costs a hard parse and a child cursor each. The rows the previous run had not fetched are
+	// discarded and the values of its last batch become invalid.
+	void Execute(const SqlStatement &statement);
+
 	// Next batch: its row count, 0 at the end. Reads the batch's LOB values; when the LOB values of a batch
-	// make it larger than the budget, the next batches ask for fewer rows.
+	// make it larger than the budget, the next batches (of this run and the next ones) ask for fewer rows.
 	uint32_t Fetch();
+
+	// The statement text, prepared once
+	const std::string &sql() const {
+		return sql_;
+	}
 
 	// Size of the define arrays: clamp(budget / row bytes, 1, max_rows), where a row counts define_bytes + 8 per
 	// column and 12 KiB per LOB column (OCI's memory for a locator and its LOB prefetch)
@@ -75,8 +87,7 @@ private:
 		OCIDefine *define = nullptr; // freed with the statement
 	};
 
-	void Open(const SqlStatement &statement, const std::vector<const ReadColumnPlan *> &columns,
-	          const FetchOptions &options);
+	void Open(const std::vector<const ReadColumnPlan *> &columns, const FetchOptions &options);
 	void Define(ub4 position, const ReadColumnPlan &plan, const FetchOptions &options, Column &column);
 	void CheckValues(uint32_t rows) const;
 	void ReadLobs(uint32_t rows);
@@ -91,9 +102,11 @@ private:
 	uint32_t next_rows_ = 1; // rows asked by the next fetch
 	uint32_t lob_read_chunk_ = 0;
 	bool has_lobs_ = false;
+	std::string sql_;
 	OCIStmt *stmt_ = nullptr;
-	std::vector<BindValue> binds_; // bound by address: kept until the statement is released
+	std::vector<BindValue> binds_; // bound by address: kept until the next run or the release of the statement
 	std::vector<sb2> bind_ind_;
+	std::vector<OCIBind *> bind_handles_; // freed with the statement; given back to OCI when binding again
 	std::vector<Column> columns_;
 	std::unique_ptr<uint8_t[]> lob_data_;
 	size_t lob_capacity_ = 0;

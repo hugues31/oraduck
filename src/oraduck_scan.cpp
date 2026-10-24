@@ -125,9 +125,11 @@ struct OraduckScanGlobalState : public GlobalTableFunctionState {
 // One thread of a scan: its own Oracle session, opened when it takes its first unit
 struct OraduckScanLocalState : public LocalTableFunctionState {
 	std::unique_ptr<oraduck::OciSession> session;
-	std::unique_ptr<oraduck::FetchCursor> cursor; // the current unit; declared after the session, released before it
-	uint32_t batch_rows = 0;                      // rows of the cursor's last batch
-	uint32_t batch_next = 0;                      // first row of that batch not yet returned
+	// The unit statement, prepared once and run for each unit; declared after the session, released before it
+	std::unique_ptr<oraduck::FetchCursor> cursor;
+	bool reading = false;    // the cursor's current unit may have rows left
+	uint32_t batch_rows = 0; // rows of the cursor's last batch
+	uint32_t batch_next = 0; // first row of that batch not yet returned
 	bool finished = false;
 };
 
@@ -247,27 +249,37 @@ bool NextBatch(ClientContext &context, const OraduckScanBindData &bind, OraduckS
 	while (true) {
 		// An interrupt or max_execution_time stops the scan between two fetches
 		context.BlockingInterruptCheck();
-		if (lstate.cursor) {
+		if (lstate.reading) {
 			const uint32_t rows = lstate.cursor->Fetch();
 			if (rows > 0) {
 				lstate.batch_rows = rows;
 				lstate.batch_next = 0;
 				return true;
 			}
-			lstate.cursor.reset();
+			lstate.reading = false;
 		}
 		const idx_t unit = gstate.next_unit.fetch_add(1);
 		if (unit >= gstate.plan.slices.size()) {
-			lstate.session.reset(); // nothing left for this thread: release its session now
+			// nothing left for this thread: release its statement and its session now
+			lstate.cursor.reset();
+			lstate.session.reset();
 			lstate.finished = true;
 			return false;
 		}
 		if (!lstate.session) {
 			lstate.session = TakeSession(bind, gstate);
 		}
-		lstate.cursor = std::make_unique<oraduck::FetchCursor>(
-		    *lstate.session, oraduck::BuildScanSql(gstate.sql, gstate.plan.slices[unit]), gstate.projected,
-		    oraduck::FetchOptions());
+		// The units of a scan share one text (their slices are binds): the session parses it once and runs it for
+		// each unit. Preparing it per unit costs a hard parse and a child cursor per unit with AS OF SCN.
+		auto statement = oraduck::BuildScanSql(gstate.sql, gstate.plan.slices[unit]);
+		if (lstate.cursor && lstate.cursor->sql() == statement.sql) {
+			lstate.cursor->Execute(statement);
+		} else {
+			lstate.cursor.reset();
+			lstate.cursor = std::make_unique<oraduck::FetchCursor>(*lstate.session, statement, gstate.projected,
+			                                                       oraduck::FetchOptions());
+		}
+		lstate.reading = true;
 	}
 }
 

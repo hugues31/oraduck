@@ -58,8 +58,12 @@ FetchCursor::FetchCursor(OciSession &session, const SqlStatement &statement,
 	rows_ = RowsWithin(budget_, row_bytes_, std::max<uint32_t>(options.max_rows, 1));
 	next_rows_ = rows_;
 	lob_read_chunk_ = options.lob_read_chunk_for_tests;
+	sql_ = statement.sql;
+	bind_handles_.assign(statement.binds.size(), nullptr);
+	bind_ind_.assign(statement.binds.size(), 0);
 	try {
-		Open(statement, columns, options);
+		Open(columns, options);
+		Execute(statement);
 	} catch (...) {
 		Close();
 		throw;
@@ -70,24 +74,11 @@ FetchCursor::~FetchCursor() {
 	Close();
 }
 
-void FetchCursor::Open(const SqlStatement &statement, const std::vector<const ReadColumnPlan *> &columns,
-                       const FetchOptions &options) {
+void FetchCursor::Open(const std::vector<const ReadColumnPlan *> &columns, const FetchOptions &options) {
 	OCIError *err = session_.err();
-	CheckOci(Oci().OCIStmtPrepare2(session_.svc(), &stmt_, err, Text(statement.sql),
-	                               static_cast<ub4>(statement.sql.size()), nullptr, 0, OCI_NTV_SYNTAX, OCI_DEFAULT),
+	CheckOci(Oci().OCIStmtPrepare2(session_.svc(), &stmt_, err, Text(sql_), static_cast<ub4>(sql_.size()), nullptr,
+	                               0, OCI_NTV_SYNTAX, OCI_DEFAULT),
 	         err, "OCIStmtPrepare2");
-	binds_ = statement.binds;
-	bind_ind_.assign(binds_.size(), 0);
-	static uint8_t empty = 0;
-	for (size_t i = 0; i < binds_.size(); i++) {
-		auto &bytes = binds_[i].bytes;
-		bind_ind_[i] = bytes.empty() ? -1 : 0; // an empty text is NULL in Oracle
-		OCIBind *bind = nullptr;
-		CheckOci(Oci().OCIBindByPos(stmt_, &bind, err, static_cast<ub4>(i + 1), bytes.empty() ? &empty : bytes.data(),
-		                            static_cast<sb4>(bytes.size()), binds_[i].dty, &bind_ind_[i], nullptr, nullptr, 0,
-		                            nullptr, OCI_DEFAULT),
-		         err, "OCIBindByPos");
-	}
 	ub4 prefetch_rows = 0;
 	ub4 prefetch_memory = options.prefetch_memory_bytes;
 	CheckOci(Oci().OCIAttrSet(stmt_, OCI_HTYPE_STMT, &prefetch_rows, 0, OCI_ATTR_PREFETCH_ROWS, err), err,
@@ -102,6 +93,25 @@ void FetchCursor::Open(const SqlStatement &statement, const std::vector<const Re
 			ReserveLob(kInitialLobBytes); // never a null pointer for an empty LOB
 		}
 	}
+}
+
+void FetchCursor::Execute(const SqlStatement &statement) {
+	if (statement.sql != sql_ || statement.binds.size() != bind_handles_.size()) {
+		throw OraduckError("fetch cursor run with another statement than the one it prepared");
+	}
+	OCIError *err = session_.err();
+	binds_ = statement.binds;
+	static uint8_t empty = 0;
+	for (size_t i = 0; i < binds_.size(); i++) {
+		auto &bytes = binds_[i].bytes;
+		bind_ind_[i] = bytes.empty() ? -1 : 0; // an empty text is NULL in Oracle
+		CheckOci(Oci().OCIBindByPos(stmt_, &bind_handles_[i], err, static_cast<ub4>(i + 1),
+		                            bytes.empty() ? &empty : bytes.data(), static_cast<sb4>(bytes.size()),
+		                            binds_[i].dty, &bind_ind_[i], nullptr, nullptr, 0, nullptr, OCI_DEFAULT),
+		         err, "OCIBindByPos");
+	}
+	done_ = false;
+	lob_used_ = 0;
 	CheckOci(Oci().OCIStmtExecute(session_.svc(), stmt_, err, 0, 0, nullptr, nullptr, OCI_DEFAULT), err,
 	         "OCIStmtExecute");
 }

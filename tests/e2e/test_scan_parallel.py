@@ -5,7 +5,7 @@ import textwrap
 
 import pytest
 
-from conftest import MILLION
+from conftest import MILLION, wait_for_snapshot
 from oraduck_helpers import (drop_view, env, explain_scan, fill_ids, json_documents, owner, run_duckdb, scan_call,
                              scan_json, scan_output, secret_sql, split_warnings)
 
@@ -87,6 +87,34 @@ def test_reader_uses_parallel_execute_chunks(million, oracle):
         assert logs[0]["message"] == warnings[0]
     finally:
         drop_view(oracle, view)
+
+
+def sql_cursors(oracle, pattern: str) -> tuple[int, int, int]:
+    """(child cursors, executions, parse calls) in V$SQL of the OraDuck scan statements whose text matches pattern."""
+    with oracle.cursor() as cur:
+        cur.execute("SELECT COUNT(*), NVL(SUM(executions), 0), NVL(SUM(parse_calls), 0) FROM v$sql "
+                    "WHERE sql_text LIKE 'SELECT /* oraduck_scan */%' AND sql_text LIKE :p", p=pattern)
+        return tuple(int(v) for v in cur.fetchone())
+
+
+def test_one_parse_per_session_with_as_of_scn(oracle, table):
+    """Oracle never shares a flashback cursor between parse calls: each session must parse the unit statement once
+    and run every unit it takes with new binds (one child cursor per session, not per unit)."""
+    rows = 32_000
+    table.execute(f"CREATE TABLE {table.name} (ID NUMBER(10), PAD VARCHAR2(20)) STORAGE (INITIAL 64K) "
+                  "PARTITION BY HASH (ID) PARTITIONS 32")
+    fill_ids(table, rows, "ID, PAD", "n, 'row ' || n")
+    wait_for_snapshot(table, rows)
+    call = scan_call(table.name, "sessions := 4")
+    (info,) = explain_scan(f"SELECT sum(id) FROM {call}", setup=THREADS, analyze=True)
+    units = int(info["Units"])
+    assert units >= 24 and info["Sessions"] == "4" and info["Snapshot"].isdigit(), info
+    # The text of the statement summed above (the ID column only), AS OF the snapshot
+    children, executions, parses = sql_cursors(oracle, f'%"ID" FROM "{owner()}"."{table.name}" AS OF SCN %')
+    assert executions == units
+    assert children <= 4 and parses <= 4, (children, executions, parses)
+    rows_read = scan_json(f"SELECT count(pad) AS n, sum(id)::BIGINT AS s FROM {call}", setup=THREADS)
+    assert rows_read == [{"n": rows, "s": rows * (rows + 1) // 2}]
 
 
 def test_two_scans_in_one_query(million):
