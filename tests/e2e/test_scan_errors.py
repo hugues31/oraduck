@@ -7,7 +7,7 @@ import uuid
 import pytest
 
 from oraduck_helpers import (DUCKDB, WORKDIR, OracleTable, drop_view, env, fill_ids, owner, scan_call, scan_error,
-                             secret_sql)
+                             scan_json, secret_sql)
 
 ROWS_7M = 7_000_000
 
@@ -109,10 +109,13 @@ def test_bind_errors(oracle, table):
     bigint = scan_call(table.name, "unconstrained_number := 'BIGINT'")
     err = scan_error(f"SELECT * FROM {bigint};")
     assert "BIGINT" in err and "DECIMAL(p,s)" in err
-    # READER may read neither DBMS_FLASHBACK nor V$DATABASE: no common snapshot, an error under 'scn'
-    scn = scan_call(f"{owner()}.{table.name}", "snapshot := 'scn'")
+    # READER may read neither DBMS_FLASHBACK nor V$DATABASE: no common snapshot, an error under 'scn' for a scan of
+    # several units; one statement (here the empty table has no unit at all) needs no snapshot
+    scn = scan_call(f"{owner()}.{table.name}", "snapshot := 'scn', split := 'hash', sessions := 2")
     err = scan_error(f"SELECT * FROM {scn};", reader=True)
     assert "snapshot 'scn'" in err and "DBMS_FLASHBACK" in err, err
+    single = scan_call(f"{owner()}.{table.name}", "snapshot := 'scn'")
+    assert scan_json(f"SELECT count(*) AS n FROM {single}", reader=True) == [{"n": 0}]
 
 
 def test_forced_strategy_that_cannot_run(oracle, table):
