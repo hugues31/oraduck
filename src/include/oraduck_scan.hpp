@@ -2,6 +2,8 @@
 
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/planner/expression.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 
 // OraDuck (OCI) headers after DuckDB
 #include "oraduck/describe_source.hpp"

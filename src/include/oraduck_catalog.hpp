@@ -6,6 +6,9 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/reference_map.hpp"
+#include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/planner/expression.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 

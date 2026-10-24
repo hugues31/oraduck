@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 
 // OraDuck (OCI) headers after DuckDB
 #include "oraduck/fetch_cursor.hpp"
