@@ -12,7 +12,11 @@ TEST_CASE("EncodeRowid", "[rowid]") {
 
 TEST_CASE("TargetBlocks", "[rowid]") {
 	CHECK(TargetBlocks(100000, 8) == 3125);
-	CHECK(TargetBlocks(100, 8) == 128);
+	// At least one default 8 MB extent (1,024 blocks of 8 KB): a small segment is one unit, not eight
+	CHECK(TargetBlocks(100, 8) == 1024);
+	CHECK(TargetBlocks(1024, 8) == 1024);
+	CHECK(TargetBlocks(32768, 8) == 1024);
+	CHECK(TargetBlocks(32800, 8) == 1025);
 	CHECK(TargetBlocks(1000000, 0) == 250000);
 }
 
@@ -65,18 +69,18 @@ TEST_CASE("BuildRowidSlices chains the units of one object and orders largest fi
 }
 
 TEST_CASE("BuildRowidSlices cuts large extents at block boundaries", "[rowid]") {
-	// A partition of four 8 MB extents (1,024 blocks) in a bigfile tablespace, the second extent crossing a
-	// 2^22-block boundary: TargetBlocks(4096, 4) = 256 gives 4 units per session, 4 per extent
-	const uint32_t base = (5u << 22) - 1536;
+	// A partition of four 64 MB extents (8,192 blocks) in a bigfile tablespace, the second extent crossing a
+	// 2^22-block boundary: TargetBlocks(32768, 4) = 2048 gives 4 units per session, 4 per extent
+	const uint32_t base = (5u << 22) - 12288;
 	std::vector<SegmentExtent> extents;
 	for (uint32_t i = 0; i < 4; i++) {
-		extents.push_back({42, 1024, base + i * 1024, 1024});
+		extents.push_back({42, 1024, base + i * 8192, 8192});
 	}
-	const auto slices = BuildRowidSlices(extents, TargetBlocks(4096, 4));
+	const auto slices = BuildRowidSlices(extents, TargetBlocks(32768, 4));
 	REQUIRE(slices.size() == 16);
 	CHECK(slices[0].rowid_lo == EncodeRowid(42, 0, 0, 0));
 	for (size_t i = 0; i + 1 < slices.size(); i++) {
-		CHECK(slices[i].rowid_hi == EncodeRowid(42, 1024, base + static_cast<uint32_t>(i + 1) * 256, 0));
+		CHECK(slices[i].rowid_hi == EncodeRowid(42, 1024, base + static_cast<uint32_t>(i + 1) * 2048, 0));
 		CHECK(slices[i].rowid_hi == slices[i + 1].rowid_lo);
 	}
 	CHECK(slices[15].rowid_hi == EncodeRowid(43, 0, 0, 0));

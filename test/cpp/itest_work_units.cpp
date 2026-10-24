@@ -3,6 +3,7 @@
 #include "oraduck/fetch_cursor.hpp"
 #include "oraduck/read_sql.hpp"
 #include "oraduck/read_types.hpp"
+#include "oraduck/rowid_ranges.hpp"
 #include "oraduck/work_units.hpp"
 #include "itest_support.hpp"
 
@@ -239,15 +240,18 @@ void CheckPartitionedTable(const std::string &table, const std::string &tablespa
 	REQUIRE(files.size() == 1);
 	CHECK((files[0][0] == "1024") == bigfile);
 
-	// Largest subpartition: P1_S_A
+	// Largest subpartition: P1_S_A, several extents
 	const auto largest = session.QueryStrings(
-	    "SELECT o.subobject_name, TO_CHAR(o.data_object_id) FROM user_segments s JOIN user_objects o ON "
-	    "o.object_name = s.segment_name AND o.subobject_name = s.partition_name WHERE s.segment_name = :1 "
-	    "ORDER BY s.blocks DESC, o.subobject_name",
+	    "SELECT o.subobject_name, TO_CHAR(o.data_object_id), TO_CHAR(s.blocks) FROM user_segments s JOIN "
+	    "user_objects o ON o.object_name = s.segment_name AND o.subobject_name = s.partition_name WHERE "
+	    "s.segment_name = :1 ORDER BY s.blocks DESC, o.subobject_name",
 	    {table});
 	REQUIRE(!largest.empty());
 	REQUIRE(largest[0][0] == "P1_S_A");
 	const auto largest_object = static_cast<uint32_t>(std::stoul(largest[0][1]));
+	const uint64_t largest_blocks = std::stoull(largest[0][2]);
+	REQUIRE(largest_blocks > 2 * kMinUnitBlocks);
+	const uint64_t target = TargetBlocks(largest_blocks, kSessions);
 
 	const auto source = DescribeSource(session, ParseTargetName(table));
 
@@ -288,8 +292,8 @@ void CheckPartitionedTable(const std::string &table, const std::string &tablespa
 			CHECK(slice.kind == SliceKind::kRowidRange);
 			CHECK_FALSE(slice.hi_inclusive);
 		}
-		// Units sized from the largest segment: at least 4 per session in the largest subpartition
-		CHECK(UnitsOfObject(plan, largest_object) >= 4 * kSessions);
+		// Units sized from the largest segment (at least one 8 MB extent each): the largest subpartition is cut
+		CHECK(UnitsOfObject(plan, largest_object) == (largest_blocks + target - 1) / target);
 		CheckEveryRowOnce(session, source, plan, kRows, sum);
 
 		const auto reader_source = DescribeSource(reader, ParseTargetName(owner + "." + table));
@@ -302,7 +306,7 @@ void CheckPartitionedTable(const std::string &table, const std::string &tablespa
 			CHECK(slice.kind == SliceKind::kRowidRange);
 			CHECK(slice.hi_inclusive);
 		}
-		CHECK(UnitsOfObject(chunks, largest_object) >= 4 * kSessions);
+		CHECK(UnitsOfObject(chunks, largest_object) >= 2);
 		CheckEveryRowOnce(reader, reader_source, chunks, kRows, sum);
 		CHECK(LeftoverTasks(reader) == 0);
 

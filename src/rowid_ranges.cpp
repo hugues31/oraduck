@@ -38,7 +38,7 @@ std::string EncodeRowid(uint32_t data_object_id, uint32_t relative_fno, uint32_t
 
 uint64_t TargetBlocks(uint64_t largest_segment_blocks, uint32_t sessions) {
 	const uint64_t divisor = 4ULL * std::max<uint32_t>(sessions, 1);
-	return std::max<uint64_t>((largest_segment_blocks + divisor - 1) / divisor, 128);
+	return std::max<uint64_t>((largest_segment_blocks + divisor - 1) / divisor, kMinUnitBlocks);
 }
 
 std::vector<Slice> BuildRowidSlices(std::vector<SegmentExtent> extents, uint64_t target_blocks) {

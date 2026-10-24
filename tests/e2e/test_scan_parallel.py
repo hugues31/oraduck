@@ -28,9 +28,10 @@ def test_split_strategies_agree(million, split):
     assert info["Strategy"] == split
     units = int(info["Units"])
     if split == "extents":
-        assert units >= 8
+        # About 25 MB: units of at least one 8 MB extent (1,024 blocks)
+        assert units >= 3
         assert "DBA_EXTENTS" in info["Notes"]
-        assert int(info["Sessions"]) == 8
+        assert int(info["Sessions"]) == min(8, units)
     elif split == "hash":
         assert units == 8 and int(info["Sessions"]) == 8
     else:
@@ -62,7 +63,7 @@ def test_reader_uses_parallel_execute_chunks(million, oracle):
         (info,) = explain_scan(f"SELECT sum(id) FROM {call}", setup=THREADS, analyze=True, reader=True)
         assert info["Strategy"] == "extents"
         assert "DBMS_PARALLEL_EXECUTE" in info["Notes"]
-        assert int(info["Units"]) >= 8
+        assert int(info["Units"]) >= 2
         assert info["Snapshot"] == "per session"
         assert "AS OF" not in info["Oracle SQL"]
         rows = scan_json(f"SELECT count(*) AS n, sum(id)::BIGINT AS s FROM {call}", setup=THREADS, reader=True)

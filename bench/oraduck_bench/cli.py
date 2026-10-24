@@ -1,4 +1,4 @@
-"""Entry point: oraduck-bench {smoke,tune,scaling,matrix,competitors,report,read-smoke,read-matrix,read-competitors,read-shaped,read-compression,read-report,read-external}."""
+"""Entry point: oraduck-bench {smoke,tune,scaling,matrix,competitors,report,read-smoke,read-matrix,read-competitors,read-shaped,read-compression,read-segments,read-report,read-external}."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from . import duck, netlink, read_methods, read_runner, runner
+from . import duck, netlink, read_methods, read_runner, read_segments, runner
 from .config import (COLS, RESULTS, ROWS, SCALING_CASE, SCALING_THREADS, THREADS, TUNE_STREAM_SIZES,
                      OracleConfig)
 from .read_config import READ_CASES, READ_COMPETITOR_RUNS, READ_COMPETITOR_SERIES, READ_RUNS
@@ -95,6 +95,8 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_parser(name)
     shaped_parser = sub.add_parser("read-shaped")  # always 1M x 550: no --only
     shaped_parser.add_argument("--runs", type=int, default=None, help="measured runs per method")
+    segments_parser = sub.add_parser("read-segments")  # pruned-unit overhead on ~300 one-row segments
+    segments_parser.add_argument("--runs", type=int, default=None, help="measured runs per split")
     for name in ("read-matrix", "read-competitors"):
         read_parser = sub.add_parser(name)
         read_parser.add_argument("--only", action="append", default=[], metavar="ROWSxCOLS",
@@ -131,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--runs must be at least 1")
     only = parse_only(args.only) if hasattr(args, "only") else []
     shaping = None
-    if args.command in ("read-smoke", "read-matrix", "read-competitors", "read-compression"):
+    if args.command in ("read-smoke", "read-matrix", "read-competitors", "read-compression", "read-segments"):
         leftover = netlink.bridge_delay_us()
         if leftover:
             raise SystemExit(f"the Oracle bridge still has a netem delay ({leftover} us): this run would be "
@@ -189,6 +191,8 @@ def main(argv: list[str] | None = None) -> int:
             methods = [m for m, t in READ_COMPETITOR_SERIES if t == threads]
             read_runner.run_read_case(cfg, *SHAPED_CASE, methods, args.runs or READ_COMPETITOR_RUNS, out,
                                       threads=threads, timeouts=timeouts, link_counter=counter, shaping=shaping)
+    elif args.command == "read-segments":
+        read_segments.run_segments(cfg, out, args.runs or read_segments.SEGMENTS_RUNS)
     elif args.command == "read-compression":
         compressed = OracleConfig(cfg.user, cfg.password, compression_dsn(cfg.dsn))
         read_runner.run_read_case(compressed, *SHAPED_CASE, ["oraduck"], READ_RUNS, out, link_counter=_link_counter(),

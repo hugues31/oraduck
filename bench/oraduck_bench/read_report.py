@@ -35,12 +35,12 @@ def label(method: str) -> str:
 
 
 def load(files: list[Path]) -> dict:
-    out = {"env": [], "measure": [], "planning": [], "events": []}
+    out = {"env": [], "measure": [], "planning": [], "segments": [], "events": []}
     for path in files:
         for line in Path(path).read_text().splitlines():
             record = json.loads(line)
             kind = record["type"]
-            if kind in ("env", "measure", "planning"):
+            if kind in ("env", "measure", "planning", "segments"):
                 out[kind].append(record)
             elif kind in EVENT_TYPES:
                 out["events"].append(record)
@@ -328,6 +328,34 @@ def _planning_section(planning: list[dict], local: dict[Group, list[dict]]) -> l
     return lines + [""]
 
 
+def _segments_section(records: list[dict]) -> list[str]:
+    lines = ["## Pruned-unit overhead", ""]
+    latest = {r["query"]: r for r in records}  # the last run of each query
+    if not latest:
+        return lines + ["No pruned-unit measurement (`oraduck-bench read-segments`).", ""]
+    first = next(iter(latest.values()))
+    runs = len(first["default"]["runs_s"])
+    lines += [f"`oraduck-bench read-segments`: a LIST/LIST table of {first['segments']} segments, all but the target "
+              f"partition's holding one row, read on the target partition ({first['target_rows']:,} rows, "
+              f"`{first['where']}`) with N = {first['threads']}: the default split gives every segment its units (the "
+              "pruned ones return no row), `split := 'none'` runs one query. Median of "
+              f"{runs} runs after a warm-up, the two splits alternating; units, planning time and snapshot from one "
+              "`EXPLAIN ANALYZE`. Overhead = default median − `none` median, and per extra unit.", "",
+              "| Query | Split | Units | Planning (ms) | Snapshot | Median (s) | Min–max (s) | Overhead |",
+              "|---|---|---|---|---|---|---|---|"]
+    for query, record in latest.items():
+        default, none = record["default"], record["none"]
+        extra_units = (default["units"] or 0) - (none["units"] or 0)
+        per_unit = f" ({record['difference_s'] / extra_units * 1000:.2f} ms per extra unit)" if extra_units > 0 else ""
+        for split, data in (("default", default), ("none", none)):
+            times = data["runs_s"]
+            planning = "—" if data.get("planning_ms") is None else f"{data['planning_ms']:.1f}"
+            overhead = f"{record['difference_s']:+.3f} s{per_unit}" if split == "default" else ""
+            lines.append(f"| `{query}` | {split} | {data.get('units', '?')} | {planning} | {data.get('snapshot') or '—'} "
+                         f"| {data['median_s']:.3f} | {min(times):.3f}–{max(times):.3f} | {overhead} |")
+    return lines + [""]
+
+
 def _criteria(local: dict[Group, list[dict]], shaped: dict[Group, list[dict]], mismatches: list[dict],
               any_measure: bool) -> list[str]:
     def verdict(ok: bool | None, detail: str = "") -> str:
@@ -377,6 +405,7 @@ def write_read_report(files: list[Path], out: Path = ROOT / "bench" / "REPORT_RE
     lines += _shaped_section(shaped, local, data["events"], out_dir)
     lines += _compression_section(compressed, local)
     lines += _planning_section(data["planning"], local)
+    lines += _segments_section(data["segments"])
     lines += _criteria(local, shaped, [e for e in data["events"] if e["type"] == "mismatch"], bool(measures))
     text = Path(analysis).read_text().strip() if analysis is not None and Path(analysis).exists() else PLACEHOLDER
     lines += ["## Analysis", "", text, ""]
