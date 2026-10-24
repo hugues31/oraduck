@@ -653,6 +653,71 @@ TEST_CASE("Fetch cursor: large LOB values bound the batches by the budget", "[or
 	}
 }
 
+TEST_CASE("Fetch cursor: the first batch of a LOB cursor is bounded", "[oracle][fetch_cursor][lob]") {
+	OciSession session(TestCredentials());
+	DropGuard guard {session, {"ITEST_FC_FIRST"}};
+	guard.DropAll();
+	session.Execute("CREATE TABLE ITEST_FC_FIRST (ID NUMBER(10), C CLOB)");
+	// 24 rows of the same 1,000,000 ASCII characters (1 MB)
+	const std::string value =
+	    BuildClob(session, {{"0123456789", 100000}},
+	              "INSERT INTO ITEST_FC_FIRST (ID, C) SELECT LEVEL, c FROM dual CONNECT BY LEVEL <= 24");
+	REQUIRE(value.size() == 1000000);
+	ReadPlan plan(session, "ITEST_FC_FIRST");
+	constexpr uint64_t kRowBytes = 16 + 12288; // ID (8 + 8) and a LOB locator
+
+	auto read = [&](const FetchOptions &options, std::vector<uint32_t> &batches, std::vector<uint64_t> &bytes) {
+		FetchCursor cursor(session, plan.statement, plan.columns, options);
+		int64_t rows = 0, wrong = 0;
+		for (uint32_t n; (n = cursor.Fetch()) > 0;) {
+			uint64_t batch_bytes = 0;
+			for (uint32_t r = 0; r < n; r++) {
+				uint32_t length = 0;
+				const uint8_t *data = cursor.Value(1, r, length);
+				wrong += !data || std::string(reinterpret_cast<const char *>(data), length) != value;
+				batch_bytes += length;
+			}
+			batches.push_back(n);
+			bytes.push_back(batch_bytes);
+			rows += n;
+		}
+		CHECK(rows == 24);
+		CHECK(wrong == 0);
+		return cursor.rows_per_fetch();
+	};
+
+	// Values that fit the LOB prefetch (262,144 characters, up to 1 MiB of UTF-8): the first batch, before any
+	// value is known, holds the rows whose prefetch fits the budget, so it stays within the budget
+	{
+		FetchOptions options;
+		options.buffer_budget_bytes = 8 * 1024 * 1024;
+		options.lob_prefetch_chars = 262144;
+		std::vector<uint32_t> batches;
+		std::vector<uint64_t> bytes;
+		CHECK(read(options, batches, bytes) == 8388608 / kRowBytes); // the define arrays keep their size
+		REQUIRE(!batches.empty());
+		CHECK(batches[0] == 8388608 / (kRowBytes + 262144 * 4));
+		for (size_t b = 0; b < batches.size(); b++) {
+			INFO("batch " << b << ": " << batches[b] << " rows, " << bytes[b] << " LOB bytes");
+			CHECK(bytes[b] + batches[b] * kRowBytes <= options.buffer_budget_bytes);
+		}
+	}
+	// The default prefetch (32,768 characters): the first batch counts 4 bytes per prefetched character; the
+	// values beyond the prefetch then shrink the next batches to the budget
+	{
+		FetchOptions options;
+		options.buffer_budget_bytes = 1024 * 1024;
+		std::vector<uint32_t> batches;
+		std::vector<uint64_t> bytes;
+		read(options, batches, bytes);
+		REQUIRE(batches.size() > 1);
+		CHECK(batches[0] == 1048576 / (kRowBytes + 32768 * 4));
+		for (size_t b = 1; b < batches.size(); b++) {
+			CHECK(batches[b] == 1);
+		}
+	}
+}
+
 TEST_CASE("Fetch cursor: 550-column table with a 16 MiB budget", "[oracle][fetch_cursor]") {
 	OciSession session(TestCredentials());
 	DropGuard guard {session, {"ITEST_FC_WIDE"}};

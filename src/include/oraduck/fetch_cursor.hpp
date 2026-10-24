@@ -40,8 +40,10 @@ public:
 	// discarded and the values of its last batch become invalid.
 	void Execute(const SqlStatement &statement);
 
-	// Next batch: its row count, 0 at the end. Reads the batch's LOB values; when the LOB values of a batch
-	// make it larger than the budget, the next batches (of this run and the next ones) ask for fewer rows.
+	// Next batch: its row count, 0 at the end. Reads the batch's LOB values. The first batch of a LOB cursor asks
+	// for budget / (row bytes + the LOB prefetch of each LOB column, 4 bytes per character) rows; each next batch
+	// (of this run and the next ones) for the rows that fit the budget with the LOB bytes per row of the previous
+	// batch. Values longer than the prefetch can make the first batch exceed the budget.
 	uint32_t Fetch();
 
 	// The statement text, prepared once
@@ -99,7 +101,7 @@ private:
 	uint64_t budget_ = 0;
 	uint64_t row_bytes_ = 0; // budgeted bytes per row, without LOB values
 	uint32_t rows_ = 1;      // define array size
-	uint32_t next_rows_ = 1; // rows asked by the next fetch
+	uint32_t next_rows_ = 1; // rows asked by the next fetch (at most rows_)
 	uint32_t lob_read_chunk_ = 0;
 	bool has_lobs_ = false;
 	std::string sql_;

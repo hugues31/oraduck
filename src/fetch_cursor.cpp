@@ -36,6 +36,18 @@ uint64_t RowBytes(const std::vector<const ReadColumnPlan *> &columns) {
 	return std::max<uint64_t>(row_bytes, 1);
 }
 
+// LOB bytes per row of the first batch, before any value is known: each LOB value counts as its whole prefetch
+// (4 bytes per character of a CLOB or NCLOB read as UTF-8)
+uint64_t FirstBatchLobBytes(const std::vector<const ReadColumnPlan *> &columns, uint32_t lob_prefetch_chars) {
+	uint64_t bytes = 0;
+	for (const auto *column : columns) {
+		if (column->lob) {
+			bytes += static_cast<uint64_t>(lob_prefetch_chars) * (column->dty == SQLT_BLOB ? 1 : kMaxUtf8BytesPerChar);
+		}
+	}
+	return bytes;
+}
+
 // clamp(budget / row_bytes, 1, max_rows)
 uint32_t RowsWithin(uint64_t budget, uint64_t row_bytes, uint64_t max_rows) {
 	return static_cast<uint32_t>(std::min(std::max<uint64_t>(budget / row_bytes, 1), max_rows));
@@ -56,7 +68,9 @@ FetchCursor::FetchCursor(OciSession &session, const SqlStatement &statement,
 	budget_ = options.buffer_budget_bytes;
 	row_bytes_ = RowBytes(columns);
 	rows_ = RowsWithin(budget_, row_bytes_, std::max<uint32_t>(options.max_rows, 1));
-	next_rows_ = rows_;
+	// The first batch of a LOB cursor asks for the rows whose LOB prefetch fits the budget; the next ones follow
+	// the LOB bytes of the previous batch
+	next_rows_ = RowsWithin(budget_, row_bytes_ + FirstBatchLobBytes(columns, options.lob_prefetch_chars), rows_);
 	lob_read_chunk_ = options.lob_read_chunk_for_tests;
 	sql_ = statement.sql;
 	bind_handles_.assign(statement.binds.size(), nullptr);
