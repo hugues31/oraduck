@@ -31,6 +31,12 @@ Write benchmark: on Oracle 19c, over 9 table shapes from 100k × 5 to 10M × 50,
 
 See [`bench/REPORT.md`](bench/REPORT.md).
 
+Read benchmark: on 1M rows × 50 columns, OraDuck reads 3.0 times faster than
+python-oracledb (thin), 3.1 times faster than ConnectorX and 5.0 times faster
+than quack-oracle (OraDuck with 8 sessions: median of 8 runs; the others: median
+of 3 runs); see
+[`bench/REPORT_READ.md`](bench/REPORT_READ.md).
+
 ## Install
 
 Prebuilt for **DuckDB v2.0.0** on Linux x86_64 and arm64 (glibc 2.28 or later)
@@ -447,7 +453,26 @@ SQL\*Net compression requires the Oracle Advanced Compression option licence.
 
 ### Read benchmark
 
-<!-- READ BENCHMARK SUMMARY: filled after the campaign (bench/REPORT_READ.md) -->
+Reading 1M rows × 50 columns (with CLOBs) from Oracle 19c into a new DuckDB
+table, on the same laptop (no network), median of 3 runs for the competitors
+and OraDuck with 1 session, and of 8 runs for OraDuck with 8 sessions:
+
+| Method | Median (s) | Speedup of OraDuck (N = 8) |
+|---|---|---|
+| OraDuck, 8 sessions | 6.193 | — |
+| OraDuck, 1 session | 15.241 | ×2.5 |
+| python-oracledb thin | 18.459 | ×3.0 |
+| ConnectorX (8 partitions) | 19.194 | ×3.1 |
+| quack-oracle | 30.722 | ×5.0 |
+| SQL*Plus → CSV | 106.924 | ×17 |
+| python-oracledb thick | 112.579 | ×18 |
+| duckdb-oracle | — | incorrect result (empty CLOB column), not ranked |
+
+On 1M × 550 only OraDuck was measured (median 140.704 s with `ATTACH`, spread
+116.147 to 195.792 s): the competitor runs were stopped, and the spread comes
+most likely from the test environment (a 10 GB table on a laptop that was using
+swap). The 1 Gbit/s shaped series and SQL*Net compression were not measured.
+See [`bench/REPORT_READ.md`](bench/REPORT_READ.md).
 
 ## Tests
 
@@ -469,7 +494,8 @@ The benchmark compares OraDuck with "DuckDB → N CSV files → N concurrent
 bindsize=134217728 readsize=134217728 streamsize=1000000 columnarrayrows=1000`),
 and with the quack-oracle and duckdb-oracle extensions. Only the export is
 timed. Protocol and environment: [`docs/design.md`](docs/design.md) sections 8
-and 9; results: [`bench/REPORT.md`](bench/REPORT.md).
+and 9; results: [`bench/REPORT.md`](bench/REPORT.md) (write) and
+[`bench/REPORT_READ.md`](bench/REPORT_READ.md) (read).
 
 To reproduce:
 
