@@ -38,8 +38,9 @@ The project ships:
 - `INSERT INTO` an Oracle database, and any write through `ATTACH` (the attached database is read-only; reading is described in section 4.4).
 - Creating or altering tables (DDL): the target table must exist.
 - UPDATE / MERGE / upsert.
-- LOBs (CLOB, BLOB), NVARCHAR2 / NCHAR, nested types (LIST, STRUCT, MAP),
-  TIMESTAMP WITH TIME ZONE, INTERVAL, UUID, HUGEINT / UHUGEINT.
+- Writing LOBs (CLOB, BLOB), NVARCHAR2 / NCHAR, nested types (LIST, STRUCT, MAP),
+  TIMESTAMP WITH TIME ZONE, INTERVAL, UUID, HUGEINT / UHUGEINT (the read path
+  reads LOBs, NVARCHAR2 / NCHAR and time zone types: section 4.4).
 - Target tables with indexes (see 6.4).
 - A reject file like sqlldr's `badfile`: one invalid row fails the whole COPY.
 - Signed distribution (community extensions), macOS (no Instant Client 19 for

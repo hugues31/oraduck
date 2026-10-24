@@ -259,7 +259,9 @@ secret.
 - `SHOW TABLES FROM ora` lists the connected user's schema, and the other
   schemas once a query has named them: listing never walks every Oracle user.
 - A table's description is cached until `DETACH` and a new `ATTACH`: a column
-  added in Oracle is not seen before that.
+  added in Oracle is not seen before that. A name found missing stays missing
+  the same way: a table created in Oracle after a query failed to find it is
+  seen after `DETACH` and `ATTACH`.
 - The database is read-only. `INSERT`, `UPDATE`, `DELETE`, DDL and the other
   writes fail with `OraDuck: attached Oracle databases are read-only; load data
   with COPY … TO '<SCHEMA.TABLE>' (FORMAT ORADUCK, CONNECTION '<secret>')`.
@@ -301,16 +303,21 @@ partitions and use its indexes. Pushed: comparisons (`=`, `<>`, `<`, `<=`, `>`,
 combinations of these, and `CAST(ts AS DATE) = DATE '...'` on a `DATE` column.
 Everything else stays in DuckDB and is applied to the rows received.
 
-- A constant is pushed only when it has the DuckDB type of the column: `dec IN
-  (0, 0.25, -250)` against a `DECIMAL` column stays in DuckDB (the list mixes
-  constant types, so DuckDB does not give them all the column's type).
+- A filter is pushed only when it compares the bare column with constants of
+  the column's DuckDB type. `dec IN (0, 0.25, -250)` against a `DECIMAL(10,2)`
+  column stays in DuckDB: because of `-250`, DuckDB casts the column (here to
+  `DECIMAL(12,2)`), so the filter is no longer on the bare column; `dec IN
+  (0.00, 0.25, -250.00)` is pushed. Likewise, a `VARCHAR2` partition key
+  compared with a number (`key = 20240507`) is not pushed and the scan reads
+  every partition: write `key = '20240507'`.
 - String comparisons are pushed only for non-empty constants and a column
   without column-level collation; string ranges (`<`, `<=`, `>`, `>=`,
   `BETWEEN`) only on AL32UTF8 databases, for non-national columns. On another
   character set only ASCII constants are pushed.
 - Stays in DuckDB: `LIKE`, `NOT`, functions on a column, empty strings
-  (`''` is NULL in Oracle), unconstrained `NUMBER` columns (read as `DOUBLE` by
-  default), time zone types, `TIMESTAMP(n)` with n above 6, comparisons on LOB columns.
+  (`''` is NULL in Oracle), comparisons on unconstrained `NUMBER` columns (read
+  as `DOUBLE` by default) and on LOB columns (`IS [NOT] NULL` on them is
+  pushed), time zone types, `TIMESTAMP(n)` with n above 6.
 
 `EXPLAIN` shows what was pushed (`Oracle WHERE`) and the requested options:
 
@@ -390,11 +397,11 @@ For the reading user:
 | Oracle | DuckDB |
 |---|---|
 | `NUMBER(p,0)`, p ≤ 18 | `SMALLINT` (p ≤ 4), `INTEGER` (p ≤ 9), `BIGINT` |
-| other `NUMBER(p,s)` | `DECIMAL(p,s)` |
+| other `NUMBER(p,s)` | `DECIMAL(p,s)`; `DECIMAL(s,s)` when s > p |
 | `NUMBER(*,0)` | `DECIMAL(38,0)` |
 | `NUMBER(p,s)`, negative scale | exact `DECIMAL(p-s,0)` |
 | `p-s` > 38 or `s` > 38 | `DOUBLE` (digits may be lost) |
-| `NUMBER`, `FLOAT` without precision | `unconstrained_number`: `DOUBLE` by default (digits beyond about 15 are lost), `VARCHAR`, or `DECIMAL(p,s)` |
+| `NUMBER` without precision, `FLOAT`, `FLOAT(b)` (any precision) | `unconstrained_number`: `DOUBLE` by default (digits beyond about 15 are lost), `VARCHAR`, or `DECIMAL(p,s)` |
 | `BINARY_FLOAT`, `BINARY_DOUBLE` | `FLOAT`, `DOUBLE` |
 | `DATE` | `TIMESTAMP` |
 | `TIMESTAMP(n)` | `TIMESTAMP` (nanoseconds truncated to microseconds) |
@@ -426,8 +433,13 @@ SQL\*Net compression requires the Oracle Advanced Compression option licence.
   slow fetch (a heavy view) finishes first.
 - Temporary LOBs created by views that compute CLOBs are released at the end
   of the query.
-- Without an SCN, a table read twice in one query (a self join, a CTE used
-  twice) may see two Oracle snapshots.
+- Every scan has its own snapshot: two scans of the same table in one query
+  (a self join, the table named twice) read at two moments, even with
+  `SNAPSHOT 'auto'` and every privilege (each reads its own SCN). A CTE
+  referenced twice is materialized and reads Oracle once.
+- Each Oracle session holds up to 64 MiB of fetch buffers, plus the LOB values
+  of its current batch (kept up to twice that size): this memory is outside
+  DuckDB's `memory_limit`.
 - Rows come in no particular order: units are read in parallel.
 - Each DuckDB release needs a matching OraDuck build: C++ extensions are tied
   to the exact DuckDB version, and the stable C API cannot push filters.
