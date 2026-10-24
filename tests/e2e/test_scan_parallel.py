@@ -36,9 +36,13 @@ def test_split_strategies_agree(million, split):
         assert units == 8 and int(info["Sessions"]) == 8
     else:
         assert units == 1 and int(info["Sessions"]) == 1
-    # The test user may run DBMS_FLASHBACK: one snapshot SCN for every session
-    assert info["Snapshot"].isdigit(), info
-    assert f'AS OF SCN TO_NUMBER(\'{info["Snapshot"]}\')' in info["Oracle SQL"]
+    if split == "none":
+        # One statement is read-consistent by itself: no snapshot
+        assert info["Snapshot"] == "single statement" and "AS OF" not in info["Oracle SQL"], info
+    else:
+        # The test user may run DBMS_FLASHBACK: one snapshot SCN for every session
+        assert info["Snapshot"].isdigit(), info
+        assert f'AS OF SCN TO_NUMBER(\'{info["Snapshot"]}\')' in info["Oracle SQL"]
     assert float(info["Planning (ms)"]) >= 0
 
 
@@ -86,6 +90,13 @@ def test_reader_uses_parallel_execute_chunks(million, oracle):
             setup=THREADS + "CALL enable_logging(level = 'warning', storage = 'memory');\n", reader=True)
         assert [log["log_level"] for log in logs] == ["WARNING"]
         assert logs[0]["message"] == warnings[0]
+
+        # One unit is one statement: consistent without an SCN, so no warning
+        single = scan_call(f"{owner()}.{million.name}", "split := 'none'")
+        _, warnings = scan_output(f"SELECT count(*) AS n FROM {single}", setup=THREADS, reader=True)
+        assert warnings == []
+        (info,) = explain_scan(f"SELECT sum(id) FROM {single}", setup=THREADS, analyze=True, reader=True)
+        assert info["Snapshot"] == "single statement"
     finally:
         drop_view(oracle, view)
 

@@ -15,7 +15,7 @@ namespace oraduck {
 struct WorkPlan {
 	SplitStrategy strategy = SplitStrategy::kNone; // never kAuto
 	std::vector<Slice> slices;                     // none: nothing to read (table without segment)
-	std::string scn;                               // empty: no AS OF SCN
+	std::string scn;                               // empty: no AS OF SCN (always for a single slice)
 	std::string notes;                             // extent source and fallbacks, "; "-separated
 };
 
@@ -23,10 +23,11 @@ struct WorkPlan {
 // read neither. TIMESTAMP_TO_SCN(SYSTIMESTAMP) is never used: it lags a few seconds behind the commits.
 std::string ReadCurrentScn(OciSession &session);
 
-// Snapshot SCN and slices for reading source with up to `sessions` sessions. Without a current SCN or when Oracle
-// refuses AS OF SCN, snapshot 'auto' reads per session (noted) and 'scn' throws. A forced strategy that cannot run
-// throws OraduckError (OracleError when Oracle refused). Extents from DBMS_PARALLEL_EXECUTE create and drop a task,
-// which commits the session's transaction.
+// Slices for reading source with up to `sessions` sessions, and the snapshot SCN when there are several (one
+// statement is read-consistent by itself: a single unit has no SCN and no snapshot note). The SCN is read before the
+// slices. Without a current SCN or when Oracle refuses AS OF SCN, snapshot 'auto' reads per session (noted) and 'scn'
+// throws. A forced strategy that cannot run throws OraduckError (OracleError when Oracle refused). Extents from
+// DBMS_PARALLEL_EXECUTE create and drop a task, which commits the session's transaction.
 WorkPlan PlanWork(OciSession &session, const OracleTableDescription &source, SplitStrategy split, SnapshotMode snapshot,
                   uint32_t sessions);
 

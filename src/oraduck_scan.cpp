@@ -216,7 +216,8 @@ unique_ptr<GlobalTableFunctionState> OraduckScanInitGlobal(ClientContext &contex
 	const auto &slices = state->plan.slices;
 	state->first_sql = InlineBinds(oraduck::BuildScanSql(state->sql, slices.empty() ? oraduck::Slice() : slices[0]));
 
-	if (bind.options.snapshot == SnapshotMode::kAuto && state->plan.scn.empty()) {
+	// One unit is one statement, read-consistent without a snapshot
+	if (bind.options.snapshot == SnapshotMode::kAuto && state->plan.scn.empty() && slices.size() > 1) {
 		DUCKDB_LOG_WARNING(context, "OraDuck: oraduck_scan of " + DisplayName(bind.source) +
 		                                " reads without a common snapshot: " + SnapshotNotes(state->plan.notes));
 	}
@@ -370,7 +371,11 @@ void OraduckScanGetMetrics(TableFunctionGetMetricsInput &input) {
 	info["Strategy"] = SplitText(gstate.plan.strategy);
 	info["Units"] = std::to_string(gstate.plan.slices.size());
 	info["Sessions"] = std::to_string(gstate.sessions);
-	info["Snapshot"] = gstate.plan.scn.empty() ? "per session" : gstate.plan.scn;
+	const auto units = gstate.plan.slices.size();
+	info["Snapshot"] = !gstate.plan.scn.empty() ? gstate.plan.scn
+	                   : units > 1              ? "per session"
+	                   : units == 1             ? "single statement"
+	                                            : kNothing;
 	info["Notes"] = gstate.plan.notes.empty() ? kNothing : gstate.plan.notes;
 	info["Planning (ms)"] = planning;
 	info["Oracle SQL"] = gstate.first_sql;

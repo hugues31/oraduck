@@ -508,41 +508,73 @@ TEST_CASE("Work planning: table not listed in ALL_ALL_TABLES", "[oracle][work_un
 
 TEST_CASE("Work planning: snapshot refused by Oracle", "[oracle][work_units]") {
 	OciSession session(TestCredentials());
-	// The test user reads V_$SESSION, but not AS OF SCN
-	OracleTableDescription source;
-	source.owner = "SYS";
-	source.name = "V_$SESSION";
-	source.kind = SourceKind::kView;
-	const auto plan = TimedPlan(session, source, SplitStrategy::kNone, SnapshotMode::kAuto, kSessions, "bench");
+	// Flashback query on another user's table needs the FLASHBACK privilege, which the test user lacks on SYS.DUAL
+	const auto source = DescribeSource(session, ParseTargetName("SYS.DUAL"));
+	const auto plan = TimedPlan(session, source, SplitStrategy::kHash, SnapshotMode::kAuto, kSessions, "bench");
+	REQUIRE(plan.slices.size() == kSessions);
 	CHECK(plan.scn.empty());
-	CHECK_THAT(plan.notes, Catch::StartsWith("snapshot: per session (AS OF SCN: ORA-"));
-	CHECK_THAT(OracleErrorText([&] { PlanWork(session, source, SplitStrategy::kNone, SnapshotMode::kScn, kSessions); }),
-	           Catch::StartsWith("snapshot 'scn' cannot read SYS.V_$SESSION AS OF SCN ") && Catch::Contains("ORA-"));
+	CHECK_THAT(plan.notes, Catch::StartsWith("snapshot: per session (AS OF SCN: ORA-01031"));
+	CHECK_THAT(OracleErrorText([&] { PlanWork(session, source, SplitStrategy::kHash, SnapshotMode::kScn, kSessions); }),
+	           Catch::StartsWith("snapshot 'scn' cannot read SYS.DUAL AS OF SCN ") && Catch::Contains("ORA-01031"));
+
+	// One statement is read-consistent: no snapshot, so nothing to refuse (V_$SESSION has no ROWID: one session)
+	OracleTableDescription view;
+	view.owner = "SYS";
+	view.name = "V_$SESSION";
+	view.kind = SourceKind::kView;
+	for (auto split : {SplitStrategy::kNone, SplitStrategy::kAuto}) {
+		const auto single = TimedPlan(session, view, split, SnapshotMode::kScn, kSessions, "bench");
+		CHECK(single.slices.size() == 1);
+		CHECK(single.scn.empty());
+		CHECK_THAT(single.notes, !Catch::Contains("snapshot"));
+	}
 }
 
 TEST_CASE("Work planning: one session", "[oracle][work_units]") {
 	OciSession session(TestCredentials());
+	OciSession reader(ReaderCredentials());
 	DropGuard guard {session, {"ITEST_WU_ONE"}};
 	guard.DropAll();
 	session.Execute("CREATE TABLE ITEST_WU_ONE (ID NUMBER(10))");
 	session.Execute("INSERT INTO ITEST_WU_ONE SELECT LEVEL FROM dual CONNECT BY LEVEL <= 10");
+	session.Execute("GRANT SELECT ON ITEST_WU_ONE TO " + ReaderCredentials().user);
 	const auto source = DescribeSource(session, ParseTargetName("ITEST_WU_ONE"));
 
-	// No query at all: the session's execute count moves only with the two readings of it
+	// No query at all, not even for the snapshot (one statement is read-consistent): the session's execute count
+	// moves only with the two readings of it
 	const std::string executes = "SELECT TO_CHAR(m.value) FROM v$mystat m JOIN v$statname n ON n.statistic# = "
 	                             "m.statistic# WHERE n.name = 'execute count'";
 	const auto before = std::stoll(Scalar(session, executes));
 	const auto between = std::stoll(Scalar(session, executes));
-	const auto plan = PlanWork(session, source, SplitStrategy::kAuto, SnapshotMode::kNone, 1);
+	const auto plan = PlanWork(session, source, SplitStrategy::kAuto, SnapshotMode::kScn, 1);
 	const auto after = std::stoll(Scalar(session, executes));
 	CHECK(after - between == between - before);
 	CHECK(plan.strategy == SplitStrategy::kNone);
 	REQUIRE(plan.slices.size() == 1);
 	CHECK(plan.slices[0].kind == SliceKind::kNone);
 	CHECK(plan.scn.empty());
+	CHECK(plan.notes.empty());
 
 	const auto forced = PlanWork(session, source, SplitStrategy::kExtents, SnapshotMode::kNone, 1);
 	CHECK(forced.strategy == SplitStrategy::kNone);
 	CHECK(forced.slices.size() == 1);
 	CheckEveryRowOnce(session, source, forced, 10, "55");
+
+	// A table of one extent is one unit with several sessions too: no snapshot either
+	const auto extent = TimedPlan(session, source, SplitStrategy::kAuto, SnapshotMode::kScn, kSessions, "bench");
+	CHECK(extent.strategy == SplitStrategy::kExtents);
+	REQUIRE(extent.slices.size() == 1);
+	CHECK(extent.scn.empty());
+	CHECK_THAT(extent.notes, !Catch::Contains("snapshot"));
+
+	// The reader, who cannot read the current SCN: 'scn' is no error for one statement
+	const auto reader_source =
+	    DescribeSource(reader, ParseTargetName(Scalar(session, "SELECT USER FROM dual") + ".ITEST_WU_ONE"));
+	for (uint32_t sessions : {1u, kSessions}) {
+		const auto one = TimedPlan(reader, reader_source, SplitStrategy::kAuto, SnapshotMode::kScn, sessions, "reader");
+		CHECK(one.slices.size() == 1);
+		CHECK(one.scn.empty());
+		CHECK_THAT(one.notes, !Catch::Contains("snapshot"));
+	}
+	CHECK(LeftoverTasks(reader) == 0);
 }

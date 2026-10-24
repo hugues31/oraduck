@@ -90,18 +90,21 @@ std::string ReadScn(OciSession &session, std::string &failures) {
 	return "";
 }
 
-void PlanSnapshot(OciSession &session, const OracleTableDescription &source, SnapshotMode mode, WorkPlan &plan) {
-	if (mode == SnapshotMode::kNone) {
-		return;
-	}
-	std::string failures;
-	const std::string scn = ReadScn(session, failures);
+// The snapshot notes come first
+void AddSnapshotNote(WorkPlan &plan, const std::string &note) {
+	plan.notes = note + (plan.notes.empty() ? "" : "; " + plan.notes);
+}
+
+// Sets plan.scn to scn (read before the units, "" when it could not be, failures saying why) once Oracle accepts
+// AS OF SCN on the source; otherwise notes per-session reads under 'auto' and throws under 'scn'
+void PlanSnapshot(OciSession &session, const OracleTableDescription &source, SnapshotMode mode, const std::string &scn,
+                  const std::string &failures, WorkPlan &plan) {
 	if (scn.empty()) {
 		if (mode == SnapshotMode::kScn) {
 			throw OraduckError("snapshot 'scn' cannot read the current SCN: " + std::string(kScnGrants) + " (" +
 			                   failures + ")");
 		}
-		AddNote(plan, "snapshot: per session (no current SCN: " + std::string(kScnGrants) + ")");
+		AddSnapshotNote(plan, "snapshot: per session (no current SCN: " + std::string(kScnGrants) + ")");
 		return;
 	}
 	// Flashback query on another user's table needs the FLASHBACK privilege; a table changed by DDL in the last few
@@ -115,7 +118,7 @@ void PlanSnapshot(OciSession &session, const OracleTableDescription &source, Sna
 			                      OracleMessage(e),
 			                  e.ora_code);
 		}
-		AddNote(plan, "snapshot: per session (AS OF SCN: " + OracleMessage(e) + ")");
+		AddSnapshotNote(plan, "snapshot: per session (AS OF SCN: " + OracleMessage(e) + ")");
 		return;
 	}
 	plan.scn = scn;
@@ -319,22 +322,10 @@ bool PlanExtents(OciSession &session, const OracleTableDescription &source, uint
 	return false;
 }
 
-} // namespace
-
-std::string ReadCurrentScn(OciSession &session) {
-	std::string failures;
-	return ReadScn(session, failures);
-}
-
-WorkPlan PlanWork(OciSession &session, const OracleTableDescription &source, SplitStrategy split, SnapshotMode snapshot,
-                  uint32_t sessions) {
-	WorkPlan plan;
-	PlanSnapshot(session, source, snapshot, plan);
-	if (sessions <= 1 || split == SplitStrategy::kNone) {
-		PlanSingle(plan);
-		return plan;
-	}
-
+// Slices for reading source with up to `sessions` sessions (more than one): extents, hash or one session, with the
+// fallbacks of 'auto'
+void PlanUnits(OciSession &session, const OracleTableDescription &source, SplitStrategy split, uint32_t sessions,
+               WorkPlan &plan) {
 	const bool view = source.kind == SourceKind::kView;
 	if (split == SplitStrategy::kExtents && view) {
 		throw OraduckError("split 'extents' needs a table: " + DisplayName(source) + " is a view");
@@ -342,7 +333,7 @@ WorkPlan PlanWork(OciSession &session, const OracleTableDescription &source, Spl
 	if (split == SplitStrategy::kExtents || (split == SplitStrategy::kAuto && !view)) {
 		std::string error, note;
 		if (PlanExtents(session, source, sessions, plan, error, note)) {
-			return plan;
+			return;
 		}
 		if (split == SplitStrategy::kExtents) {
 			throw OraduckError(error);
@@ -360,7 +351,7 @@ WorkPlan PlanWork(OciSession &session, const OracleTableDescription &source, Spl
 		}
 		AddNote(plan, "hash: " + OracleCode(e) + ", using one session");
 		PlanSingle(plan);
-		return plan;
+		return;
 	}
 	plan.strategy = SplitStrategy::kHash;
 	plan.slices.clear();
@@ -370,6 +361,33 @@ WorkPlan PlanWork(OciSession &session, const OracleTableDescription &source, Spl
 		slice.hash_buckets = sessions;
 		slice.hash_bucket = bucket;
 		plan.slices.push_back(slice);
+	}
+}
+
+} // namespace
+
+std::string ReadCurrentScn(OciSession &session) {
+	std::string failures;
+	return ReadScn(session, failures);
+}
+
+WorkPlan PlanWork(OciSession &session, const OracleTableDescription &source, SplitStrategy split, SnapshotMode snapshot,
+                  uint32_t sessions) {
+	WorkPlan plan;
+	// One statement is read-consistent by itself: a single unit needs no snapshot
+	if (sessions <= 1 || split == SplitStrategy::kNone) {
+		PlanSingle(plan);
+		return plan;
+	}
+	// The SCN is read before the units: a segment created after it (a new partition) holds no row of the snapshot,
+	// whereas ranges built from an extent map older than the SCN would miss such a segment's rows
+	std::string scn, failures;
+	if (snapshot != SnapshotMode::kNone) {
+		scn = ReadScn(session, failures);
+	}
+	PlanUnits(session, source, split, sessions, plan);
+	if (snapshot != SnapshotMode::kNone && plan.slices.size() > 1) {
+		PlanSnapshot(session, source, snapshot, scn, failures, plan);
 	}
 	return plan;
 }
