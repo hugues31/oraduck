@@ -90,8 +90,8 @@ FetchCursor::~FetchCursor() {
 
 void FetchCursor::Open(const std::vector<const ReadColumnPlan *> &columns, const FetchOptions &options) {
 	OCIError *err = session_.err();
-	CheckOci(Oci().OCIStmtPrepare2(session_.svc(), &stmt_, err, Text(sql_), static_cast<ub4>(sql_.size()), nullptr,
-	                               0, OCI_NTV_SYNTAX, OCI_DEFAULT),
+	CheckOci(Oci().OCIStmtPrepare2(session_.svc(), &stmt_, err, Text(sql_), static_cast<ub4>(sql_.size()), nullptr, 0,
+	                               OCI_NTV_SYNTAX, OCI_DEFAULT),
 	         err, "OCIStmtPrepare2");
 	ub4 prefetch_rows = 0;
 	ub4 prefetch_memory = options.prefetch_memory_bytes;

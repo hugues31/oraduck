@@ -661,7 +661,7 @@ TEST_CASE("Fetch cursor: the first batch of a LOB cursor is bounded", "[oracle][
 	// 24 rows of the same 1,000,000 ASCII characters (1 MB)
 	const std::string value =
 	    BuildClob(session, {{"0123456789", 100000}},
-	              "INSERT INTO ITEST_FC_FIRST (ID, C) SELECT LEVEL, c FROM dual CONNECT BY LEVEL <= 24");
+		          "INSERT INTO ITEST_FC_FIRST (ID, C) SELECT LEVEL, c FROM dual CONNECT BY LEVEL <= 24");
 	REQUIRE(value.size() == 1000000);
 	ReadPlan plan(session, "ITEST_FC_FIRST");
 	constexpr uint64_t kRowBytes = 16 + 12288; // ID (8 + 8) and a LOB locator
@@ -893,12 +893,10 @@ TEST_CASE("Fetch cursor: run again with new binds, parsed once", "[oracle][fetch
 	DropGuard guard {session, {"ITEST_FC_REEXEC"}};
 	guard.DropAll();
 	session.Execute("CREATE TABLE ITEST_FC_REEXEC (ID NUMBER(10), C CLOB)");
-	session.Execute("INSERT /*+ APPEND */ INTO ITEST_FC_REEXEC SELECT r, TO_CLOB('c' || r) FROM " +
-	                RowGenerator(1000));
+	session.Execute("INSERT /*+ APPEND */ INTO ITEST_FC_REEXEC SELECT r, TO_CLOB('c' || r) FROM " + RowGenerator(1000));
 	ReadPlan plan(session, "ITEST_FC_REEXEC");
 	// A tag of this run in the text: V$SQL then shows this test's cursor only
-	const std::string tag =
-	    "itest " + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+	const std::string tag = "itest " + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
 	auto bucket = [&](uint32_t k) {
 		Slice slice;
 		slice.kind = SliceKind::kHash;
@@ -939,14 +937,15 @@ TEST_CASE("Fetch cursor: run again with new binds, parsed once", "[oracle][fetch
 	for (uint32_t n; (n = cursor.Fetch()) > 0;) {
 		bucket_rows += n;
 	}
-	CHECK(std::to_string(bucket_rows) == Scalar(session, "SELECT COUNT(*) FROM ITEST_FC_REEXEC WHERE ORA_HASH(ROWID, 3) = 1"));
+	CHECK(std::to_string(bucket_rows) ==
+	      Scalar(session, "SELECT COUNT(*) FROM ITEST_FC_REEXEC WHERE ORA_HASH(ROWID, 3) = 1"));
 	// Another text is refused: the cursor runs its own statement only
 	CHECK_THROWS_AS(cursor.Execute(plan.statement), OraduckError);
 
-	const auto cursors = session.QueryStrings(
-	    "SELECT TO_CHAR(COUNT(*)), TO_CHAR(SUM(executions)), TO_CHAR(SUM(parse_calls)) FROM v$sql "
-	    "WHERE sql_text LIKE :1",
-	    {"SELECT /* oraduck_scan " + tag + " */%"});
+	const auto cursors =
+	    session.QueryStrings("SELECT TO_CHAR(COUNT(*)), TO_CHAR(SUM(executions)), TO_CHAR(SUM(parse_calls)) FROM v$sql "
+		                     "WHERE sql_text LIKE :1",
+		                     {"SELECT /* oraduck_scan " + tag + " */%"});
 	CHECK(cursors[0][0] == "1"); // child cursors
 	CHECK(cursors[0][1] == "6"); // executions
 	CHECK(cursors[0][2] == "1"); // parse calls

@@ -19,8 +19,8 @@ struct SegmentExtent {
 	uint32_t blocks;
 };
 
-// Smallest unit: one default 8 MB extent of 8 KB blocks. Each unit costs a query (about 1 ms when its partition is
-// pruned), so a small segment, often a single extent, is read as one unit.
+// Smallest unit: one default 8 MB extent of 8 KB blocks. Each unit costs an execution of the unit statement (0.7 ms
+// when its partition is pruned, probe R5), so a small segment, often a single extent, is read as one unit.
 constexpr uint64_t kMinUnitBlocks = 1024;
 
 // max(ceil(largest_segment_blocks / (4 * sessions)), kMinUnitBlocks): sized from the largest segment so that a
